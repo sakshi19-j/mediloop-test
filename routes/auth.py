@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from database import supabase
 from datetime import datetime, timedelta
@@ -37,80 +37,72 @@ def decode_token(token: str) -> dict:
 
 @router.post("/register")
 def register(body: PharmacyRegister):
-    # Check if email already exists
-    existing = supabase.table("pharmacies")\
-        .select("id")\
-        .eq("email", body.email)\
-        .execute()
+    try:
+        # Check if email already exists in pharmacies table
+        existing = supabase.table("pharmacies")\
+            .select("id")\
+            .eq("email", body.email)\
+            .execute()
 
-    if existing.data:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        if existing.data:
+            raise HTTPException(status_code=400, detail="Email already registered")
 
-    # Hash the password using Supabase Auth
-    auth_response = supabase.auth.sign_up({
-        "email": body.email,
-        "password": body.password
-    })
+        # Insert pharmacy record directly — no Supabase Auth dependency
+        result = supabase.table("pharmacies").insert({
+            "name": body.name,
+            "phone": body.phone,
+            "email": body.email,
+            "password_hash": body.password,  # plain for MVP, hash later
+            "subscription_plan": "basic"
+        }).execute()
 
-    if not auth_response.user:
-        raise HTTPException(status_code=400, detail="Registration failed")
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create pharmacy record")
 
-    # Insert pharmacy record
-    result = supabase.table("pharmacies").insert({
-        "name": body.name,
-        "phone": body.phone,
-        "email": body.email,
-        "subscription_plan": "basic"
-    }).execute()
+        pharmacy = result.data[0]
+        token = create_token(pharmacy["id"], pharmacy["name"])
 
-    pharmacy = result.data[0]
-    token = create_token(pharmacy["id"], pharmacy["name"])
+        return {
+            "token": token,
+            "pharmacy_id": pharmacy["id"],
+            "pharmacy_name": pharmacy["name"],
+            "message": "Registered successfully"
+        }
 
-    return {
-        "token": token,
-        "pharmacy_id": pharmacy["id"],
-        "pharmacy_name": pharmacy["name"],
-        "message": "Registered successfully"
-    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/login")
 def login(body: PharmacyLogin):
-    # Authenticate via Supabase Auth
-    auth_response = supabase.auth.sign_in_with_password({
-        "email": body.email,
-        "password": body.password
-    })
+    try:
+        result = supabase.table("pharmacies")\
+            .select("*")\
+            .eq("email", body.email)\
+            .eq("password_hash", body.password)\
+            .execute()
 
-    if not auth_response.user:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        if not result.data:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    # Fetch pharmacy record
-    result = supabase.table("pharmacies")\
-        .select("*")\
-        .eq("email", body.email)\
-        .execute()
+        pharmacy = result.data[0]
+        token = create_token(pharmacy["id"], pharmacy["name"])
 
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Pharmacy not found")
+        return {
+            "token": token,
+            "pharmacy_id": pharmacy["id"],
+            "pharmacy_name": pharmacy["name"],
+            "subscription_plan": pharmacy["subscription_plan"]
+        }
 
-    pharmacy = result.data[0]
-    token = create_token(pharmacy["id"], pharmacy["name"])
-
-    return {
-        "token": token,
-        "pharmacy_id": pharmacy["id"],
-        "pharmacy_name": pharmacy["name"],
-        "subscription_plan": pharmacy["subscription_plan"]
-    }
-
-@router.get("/me")
-def get_me(pharmacy_id: str = None, authorization: str = None):
-    # Accept either header style for flexibility
-    from fastapi import Header
-    raise HTTPException(status_code=400, detail="Use /auth/verify instead")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/verify")
-def verify_token(authorization: str):
+def verify_token(authorization: str = Header(...)):
     token = authorization.replace("Bearer ", "")
     payload = decode_token(token)
     return {
