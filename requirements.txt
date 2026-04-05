@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+supabase
+apscheduler
+httpx
+python-dotenv
+python-jose
+passlib[bcrypt]
