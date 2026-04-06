@@ -27,3 +27,14 @@ async def startup():
 @app.get("/")
 def root():
     return {"status": "MediLoop running"}
+
+@app.get("/test-whatsapp")
+async def test_whatsapp():
+    from whatsapp import send_reminder
+    result = await send_reminder(
+        phone="918237007450",
+        patient_name="Sudesh Dahale",
+        medicine_name="Metformin 500mg",
+        pharmacy_name="SahilMedical"
+    )
+    return result
