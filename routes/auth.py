@@ -18,6 +18,13 @@ class PharmacyLogin(BaseModel):
 @router.post("/register")
 def register(body: PharmacyRegister):
     try:
+        # Password length check
+        if len(body.password.encode('utf-8')) > 72:
+            raise HTTPException(
+                status_code=400,
+                detail="Password too long. Please use under 72 characters."
+            )
+
         existing = supabase.table("pharmacies")\
             .select("id")\
             .eq("email", body.email)\
@@ -63,6 +70,7 @@ def register(body: PharmacyRegister):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
 
 @router.post("/login")
 def login(body: PharmacyLogin):
