@@ -166,3 +166,26 @@ def delete_patient(patient_id: str, pharmacy_id: str = Header(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/opt-out")
+def handle_opt_out(phone: str):
+    """Called when patient replies STOP to WhatsApp"""
+    try:
+        # Mark all patients with this phone as opted out
+        supabase.table("patients")\
+            .update({
+                "opted_out": True,
+                "opted_out_at": datetime.utcnow().isoformat()
+            })\
+            .eq("phone", phone)\
+            .execute()
+
+        # Log in opt_outs table
+        supabase.table("opt_outs").upsert({
+            "phone": phone
+        }).execute()
+
+        return {"message": "Opted out successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

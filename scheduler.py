@@ -8,52 +8,121 @@ scheduler = AsyncIOScheduler()
 
 async def send_due_reminders():
     target_date = (date.today() + timedelta(days=2)).isoformat()
-    
-    # Fetch all medicines due in 2 days that are active
+    print(f"[Scheduler] Running for due date: {target_date}")
+
     result = supabase.table("medicines")\
-        .select("*, patients(name, phone), pharmacies(name)")\
+        .select("*, patients(name, phone, opted_out), pharmacies(name)")\
         .eq("next_due_date", target_date)\
         .eq("status", "active")\
+        .eq("is_deleted", False)\
+        .eq("is_paused", False)\
         .execute()
-    
+
     medicines = result.data
-    print(f"[Scheduler] Found {len(medicines)} reminders to send")
-    
+    print(f"[Scheduler] Found {len(medicines)} medicines due")
+
+    sent = 0
+    skipped = 0
+    failed = 0
+
     for med in medicines:
         patient = med["patients"]
         pharmacy = med["pharmacies"]
-        
-        # Check if reminder already sent today for this medicine
+
+        # Skip opted-out patients
+        if patient.get("opted_out"):
+            print(f"[Scheduler] Skipping opted-out patient {patient['name']}")
+            skipped += 1
+            continue
+
+        # Skip if reminder already sent today
         existing = supabase.table("reminder_logs")\
             .select("id")\
             .eq("medicine_id", med["id"])\
             .gte("sent_at", date.today().isoformat())\
             .execute()
-        
+
         if existing.data:
-            continue  # already sent today, skip
-        
-        # Send WhatsApp
-        await send_reminder(
+            skipped += 1
+            continue
+
+        # Send reminder
+        result = await send_reminder(
             phone=patient["phone"],
             patient_name=patient["name"],
             medicine_name=med["name"],
             pharmacy_name=pharmacy["name"]
         )
-        
-        # Log it
+
+        # Log result
+        status = "sent" if result["channel"] != "failed" else "failed"
+
         supabase.table("reminder_logs").insert({
             "medicine_id": med["id"],
             "patient_id": med["patient_id"],
             "pharmacy_id": med["pharmacy_id"],
-            "whatsapp_status": "sent"
+            "whatsapp_status": result["channel"],
         }).execute()
 
+        if status == "sent":
+            sent += 1
+        else:
+            failed += 1
+
+    print(f"[Scheduler] Done — sent: {sent}, skipped: {skipped}, failed: {failed}")
+
+async def retry_failed_reminders():
+    """Runs 2 hours after main job to retry any failures"""
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    failed = supabase.table("reminder_logs")\
+        .select("*, medicines(name, patient_id, pharmacy_id, is_paused, is_deleted, patients(name, phone, opted_out), pharmacies(name))")\
+        .eq("whatsapp_status", "failed")\
+        .gte("sent_at", yesterday)\
+        .execute()
+
+    print(f"[Retry] Found {len(failed.data)} failed reminders to retry")
+
+    for log in failed.data:
+        med = log["medicines"]
+        if not med or med.get("is_paused") or med.get("is_deleted"):
+            continue
+
+        patient = med["patients"]
+        if patient.get("opted_out"):
+            continue
+
+        result = await send_reminder(
+            phone=patient["phone"],
+            patient_name=patient["name"],
+            medicine_name=med["name"],
+            pharmacy_name=med["pharmacies"]["name"]
+        )
+
+        # Update log with retry result
+        supabase.table("reminder_logs")\
+            .update({"whatsapp_status": f"retry_{result['channel']}"})\
+            .eq("id", log["id"])\
+            .execute()
+
 def start_scheduler():
+    # Main job at 9am
     scheduler.add_job(
         lambda: asyncio.create_task(send_due_reminders()),
         trigger="cron",
         hour=9,
-        minute=0
+        minute=0,
+        id="daily_reminders"
     )
+
+    # Retry job at 11am
+    scheduler.add_job(
+        lambda: asyncio.create_task(retry_failed_reminders()),
+        trigger="cron",
+        hour=11,
+        minute=0,
+        id="retry_failed"
+    )
+
     scheduler.start()
+    print("[Scheduler] Started — daily at 9am, retry at 11am")

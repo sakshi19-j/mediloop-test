@@ -41,3 +41,41 @@ async def test_whatsapp():
         pharmacy_name="SahilMedical"
     )
     return result
+
+from fastapi import Request, Form
+
+@app.post("/webhook/twilio")
+async def twilio_webhook(
+    From: str = Form(...),
+    Body: str = Form(...)
+):
+    """Twilio calls this when patient replies to WhatsApp"""
+    message = Body.strip().upper()
+    phone = From.replace("whatsapp:+", "").replace("+", "")
+
+    if message in ["STOP", "UNSUBSCRIBE", "CANCEL", "QUIT"]:
+        from database import supabase
+        supabase.table("patients")\
+            .update({"opted_out": True})\
+            .eq("phone", phone)\
+            .execute()
+
+        supabase.table("opt_outs").upsert({"phone": phone}).execute()
+        print(f"[Webhook] Opted out: {phone}")
+
+    # Twilio expects TwiML response
+    return {"message": "ok"}
+
+@app.get("/test-scheduler")
+async def test_scheduler():
+    """Manually trigger the daily reminder job"""
+    from scheduler import send_due_reminders
+    await send_due_reminders()
+    return {"message": "Scheduler triggered"}
+
+@app.get("/test-retry")
+async def test_retry():
+    """Manually trigger the retry job"""
+    from scheduler import retry_failed_reminders
+    await retry_failed_reminders()
+    return {"message": "Retry triggered"}
