@@ -1,10 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from scheduler import start_scheduler
-from routes import auth, patients, medicines, dashboard
+from routes import auth, patients, medicines, dashboard, billing
 
-
-app = FastAPI(title="MediLoop API")
+app = FastAPI(
+    title="MediLoop API",
+    version="1.0.0",
+    description="Pharmacy recurring revenue management"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,19 +17,19 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-app.include_router(auth.router, prefix="/auth")
-app.include_router(patients.router, prefix="/patients")
-app.include_router(medicines.router, prefix="/medicines")
-app.include_router(dashboard.router, prefix="/dashboard")
-app.include_router(auth.router, prefix="/auth")
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])
+app.include_router(patients.router, prefix="/api/v1/patients", tags=["Patients"])
+app.include_router(medicines.router, prefix="/api/v1/medicines", tags=["Medicines"])
+app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["Dashboard"])
+app.include_router(billing.router, prefix="/api/v1/billing", tags=["Billing"])
 
 @app.on_event("startup")
 async def startup():
     start_scheduler()
 
-@app.get("/")
-def root():
-    return {"status": "MediLoop running"}
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "1.0.0"}
 
 @app.get("/test-whatsapp")
 async def test_whatsapp():

@@ -1,15 +1,9 @@
-from fastapi import APIRouter, HTTPException, Header
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, EmailStr
 from database import supabase
-from datetime import datetime, timedelta
-from jose import jwt
-import os
+from auth_utils import hash_password, verify_password, create_token, decode_token
 
 router = APIRouter()
-
-SECRET_KEY = os.getenv("SECRET_KEY", "mediloop-secret-change-in-prod")
-ALGORITHM = "HS256"
-TOKEN_EXPIRE_HOURS = 72
 
 class PharmacyRegister(BaseModel):
     name: str
@@ -21,24 +15,9 @@ class PharmacyLogin(BaseModel):
     email: str
     password: str
 
-def create_token(pharmacy_id: str, pharmacy_name: str) -> str:
-    payload = {
-        "pharmacy_id": pharmacy_id,
-        "pharmacy_name": pharmacy_name,
-        "exp": datetime.utcnow() + timedelta(hours=TOKEN_EXPIRE_HOURS)
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
-def decode_token(token: str) -> dict:
-    try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
 @router.post("/register")
 def register(body: PharmacyRegister):
     try:
-        # Check if email already exists in pharmacies table
         existing = supabase.table("pharmacies")\
             .select("id")\
             .eq("email", body.email)\
@@ -47,25 +26,36 @@ def register(body: PharmacyRegister):
         if existing.data:
             raise HTTPException(status_code=400, detail="Email already registered")
 
-        # Insert pharmacy record directly — no Supabase Auth dependency
+        hashed = hash_password(body.password)
+
         result = supabase.table("pharmacies").insert({
             "name": body.name,
             "phone": body.phone,
             "email": body.email,
-            "password_hash": body.password,  # plain for MVP, hash later
-            "subscription_plan": "basic"
+            "password_hash": hashed,
+            "subscription_plan": "trial"
         }).execute()
 
         if not result.data:
-            raise HTTPException(status_code=500, detail="Failed to create pharmacy record")
+            raise HTTPException(status_code=500, detail="Failed to create account")
 
         pharmacy = result.data[0]
+
+        # Create trial subscription
+        supabase.table("subscriptions").insert({
+            "pharmacy_id": pharmacy["id"],
+            "plan": "trial",
+            "status": "active",
+            "patient_limit": 20
+        }).execute()
+
         token = create_token(pharmacy["id"], pharmacy["name"])
 
         return {
             "token": token,
             "pharmacy_id": pharmacy["id"],
             "pharmacy_name": pharmacy["name"],
+            "plan": "trial",
             "message": "Registered successfully"
         }
 
@@ -80,13 +70,16 @@ def login(body: PharmacyLogin):
         result = supabase.table("pharmacies")\
             .select("*")\
             .eq("email", body.email)\
-            .eq("password_hash", body.password)\
             .execute()
 
         if not result.data:
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
         pharmacy = result.data[0]
+
+        if not verify_password(body.password, pharmacy["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
         token = create_token(pharmacy["id"], pharmacy["name"])
 
         return {
@@ -102,7 +95,7 @@ def login(body: PharmacyLogin):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/verify")
-def verify_token(authorization: str = Header(...)):
+def verify_token(authorization: str):
     token = authorization.replace("Bearer ", "")
     payload = decode_token(token)
     return {
