@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from scheduler import start_scheduler
 from routes import auth, patients, medicines, dashboard, billing, prescriptions
+from routes.webhook_whatsapp import router as whatsapp_webhook_router
 
 app = FastAPI(
     title="MediLoop API",
@@ -23,6 +24,7 @@ app.include_router(medicines.router, prefix="/api/v1/medicines", tags=["Medicine
 app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["Dashboard"])
 app.include_router(billing.router, prefix="/api/v1/billing", tags=["Billing"])
 app.include_router(prescriptions.router, prefix="/api/v1/prescriptions", tags=["Prescriptions"])
+app.include_router(whatsapp_webhook_router)
 
 @app.on_event("startup")
 async def startup():
@@ -43,40 +45,14 @@ async def test_whatsapp():
     )
     return result
 
-from fastapi import Request, Form
-
-@app.post("/webhook/twilio")
-async def twilio_webhook(
-    From: str = Form(...),
-    Body: str = Form(...)
-):
-    """Twilio calls this when patient replies to WhatsApp"""
-    message = Body.strip().upper()
-    phone = From.replace("whatsapp:+", "").replace("+", "")
-
-    if message in ["STOP", "UNSUBSCRIBE", "CANCEL", "QUIT"]:
-        from database import supabase
-        supabase.table("patients")\
-            .update({"opted_out": True})\
-            .eq("phone", phone)\
-            .execute()
-
-        supabase.table("opt_outs").upsert({"phone": phone}).execute()
-        print(f"[Webhook] Opted out: {phone}")
-
-    # Twilio expects TwiML response
-    return {"message": "ok"}
-
 @app.get("/test-scheduler")
 async def test_scheduler():
-    """Manually trigger the daily reminder job"""
     from scheduler import send_due_reminders
     await send_due_reminders()
     return {"message": "Scheduler triggered"}
 
 @app.get("/test-retry")
 async def test_retry():
-    """Manually trigger the retry job"""
     from scheduler import retry_failed_reminders
     await retry_failed_reminders()
     return {"message": "Retry triggered"}
