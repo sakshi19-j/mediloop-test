@@ -1,10 +1,14 @@
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, UploadFile, File
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from database import supabase
 from typing import Optional
 from datetime import datetime
+import csv
+import io
 
 router = APIRouter()
+
 
 class PatientCreate(BaseModel):
     name: str
@@ -12,17 +16,17 @@ class PatientCreate(BaseModel):
     disease_type: str
     notes: Optional[str] = None
 
+
 class PatientUpdate(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
     disease_type: Optional[str] = None
     notes: Optional[str] = None
 
+
 @router.post("/")
 def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
     try:
-
-        # Check subscription is active
         sub = supabase.table("subscriptions")\
             .select("status, plan")\
             .eq("pharmacy_id", pharmacy_id)\
@@ -30,17 +34,17 @@ def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
 
         if sub.data and sub.data[0]["status"] == "expired":
             raise HTTPException(
-            status_code=402,
-            detail="Subscription expired. Please renew to continue."
-        )
-        # Check plan limit
-        sub = supabase.table("subscriptions")\
+                status_code=402,
+                detail="Subscription expired. Please renew to continue."
+            )
+
+        sub_limit = supabase.table("subscriptions")\
             .select("patient_limit")\
             .eq("pharmacy_id", pharmacy_id)\
             .execute()
 
-        if sub.data:
-            limit = sub.data[0]["patient_limit"]
+        if sub_limit.data:
+            limit = sub_limit.data[0]["patient_limit"]
             count = supabase.table("patients")\
                 .select("id", count="exact")\
                 .eq("pharmacy_id", pharmacy_id)\
@@ -68,6 +72,91 @@ def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# IMPORTANT: /export and /import must come BEFORE /{patient_id}
+# FastAPI matches routes top-down — a literal path must beat a wildcard
+@router.get("/export")
+def export_patients_csv(pharmacy_id: str = Header(...)):
+    try:
+        result = supabase.table("patients")\
+            .select("name, phone, disease_type, notes, created_at")\
+            .eq("pharmacy_id", pharmacy_id)\
+            .eq("is_deleted", False)\
+            .execute()
+
+        output = io.StringIO()
+        writer = csv.DictWriter(
+            output,
+            fieldnames=["name", "phone", "disease_type", "notes", "created_at"]
+        )
+        writer.writeheader()
+        writer.writerows(result.data)
+        output.seek(0)
+
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode()),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=patients_export.csv"}
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/import")
+async def import_patients_csv(
+    file: UploadFile = File(...),
+    pharmacy_id: str = Header(...)
+):
+    try:
+        content = await file.read()
+        decoded = content.decode("utf-8")
+        reader = csv.DictReader(io.StringIO(decoded))
+
+        patients_added = []
+        errors = []
+
+        for i, row in enumerate(reader):
+            try:
+                result = supabase.table("patients").insert({
+                    "pharmacy_id": pharmacy_id,
+                    "name": row.get("name", "").strip(),
+                    "phone": row.get("phone", "").strip(),
+                    "disease_type": row.get("disease_type", "Other").strip(),
+                    "notes": row.get("notes", "").strip()
+                }).execute()
+                patients_added.append(result.data[0])
+            except Exception as e:
+                errors.append({"row": i + 2, "name": row.get("name"), "error": str(e)})
+
+        return {
+            "imported": len(patients_added),
+            "failed": len(errors),
+            "errors": errors
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/opt-out")
+def handle_opt_out(phone: str):
+    try:
+        supabase.table("patients")\
+            .update({
+                "opted_out": True,
+                "opted_out_at": datetime.utcnow().isoformat()
+            })\
+            .eq("phone", phone)\
+            .execute()
+
+        supabase.table("opt_outs").upsert({"phone": phone}).execute()
+        return {"message": "Opted out successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/")
 def get_patients(
     pharmacy_id: str = Header(...),
@@ -86,21 +175,18 @@ def get_patients(
         if disease_type:
             query = query.eq("disease_type", disease_type)
 
+        # FIX: search pushed into Supabase — works across all patients, not just current page
+        if search:
+            query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%")
+
         offset = (page - 1) * limit
         result = query.order("name").range(offset, offset + limit - 1).execute()
-
-        if search:
-            search_lower = search.lower()
-            filtered = [p for p in result.data if
-                search_lower in p["name"].lower() or
-                search_lower in p["phone"]
-            ]
-            return {"data": filtered, "page": page, "limit": limit}
 
         return {"data": result.data, "page": page, "limit": limit}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/{patient_id}")
 def get_patient_profile(patient_id: str, pharmacy_id: str = Header(...)):
@@ -139,6 +225,7 @@ def get_patient_profile(patient_id: str, pharmacy_id: str = Header(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.patch("/{patient_id}")
 def update_patient(patient_id: str, body: PatientUpdate, pharmacy_id: str = Header(...)):
     try:
@@ -161,6 +248,7 @@ def update_patient(patient_id: str, body: PatientUpdate, pharmacy_id: str = Head
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.delete("/{patient_id}")
 def delete_patient(patient_id: str, pharmacy_id: str = Header(...)):
     try:
@@ -176,104 +264,6 @@ def delete_patient(patient_id: str, pharmacy_id: str = Header(...)):
             .execute()
 
         return {"message": "Patient deleted successfully"}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/opt-out")
-def handle_opt_out(phone: str):
-    """Called when patient replies STOP to WhatsApp"""
-    try:
-        # Mark all patients with this phone as opted out
-        supabase.table("patients")\
-            .update({
-                "opted_out": True,
-                "opted_out_at": datetime.utcnow().isoformat()
-            })\
-            .eq("phone", phone)\
-            .execute()
-
-        # Log in opt_outs table
-        supabase.table("opt_outs").upsert({
-            "phone": phone
-        }).execute()
-
-        return {"message": "Opted out successfully"}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-from fastapi import UploadFile, File
-from fastapi.responses import StreamingResponse
-import csv
-import io
-
-@router.post("/import")
-async def import_patients_csv(
-    file: UploadFile = File(...),
-    pharmacy_id: str = Header(...)
-):
-    try:
-        content = await file.read()
-        decoded = content.decode("utf-8")
-        reader = csv.DictReader(io.StringIO(decoded))
-
-        patients_added = []
-        errors = []
-
-        for i, row in enumerate(reader):
-            try:
-                result = supabase.table("patients").insert({
-                    "pharmacy_id": pharmacy_id,
-                    "name": row.get("name", "").strip(),
-                    "phone": row.get("phone", "").strip(),
-                    "disease_type": row.get("disease_type", "Other").strip(),
-                    "notes": row.get("notes", "").strip()
-                }).execute()
-                patients_added.append(result.data[0])
-            except Exception as e:
-                errors.append({
-                    "row": i + 2,
-                    "name": row.get("name"),
-                    "error": str(e)
-                })
-
-        return {
-            "imported": len(patients_added),
-            "failed": len(errors),
-            "errors": errors
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/export")
-def export_patients_csv(pharmacy_id: str = Header(...)):
-    try:
-        result = supabase.table("patients")\
-            .select("name, phone, disease_type, notes, created_at")\
-            .eq("pharmacy_id", pharmacy_id)\
-            .eq("is_deleted", False)\
-            .execute()
-
-        output = io.StringIO()
-        writer = csv.DictWriter(
-            output,
-            fieldnames=["name", "phone", "disease_type", "notes", "created_at"]
-        )
-        writer.writeheader()
-        writer.writerows(result.data)
-
-        output.seek(0)
-
-        return StreamingResponse(
-            io.BytesIO(output.getvalue().encode()),
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": "attachment; filename=patients_export.csv"
-            }
-        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

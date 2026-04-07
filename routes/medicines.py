@@ -26,6 +26,10 @@ class PurchaseUpdate(BaseModel):
 @router.post("/")
 def add_medicine(medicine: MedicineCreate, pharmacy_id: str = Header(...)):
     try:
+        # FIX: compute next_due_date at insert time
+        # Without this, the scheduler can never find medicines to remind about
+        next_due = (medicine.last_purchase_date + timedelta(days=medicine.refill_days)).isoformat()
+
         result = supabase.table("medicines").insert({
             "pharmacy_id": pharmacy_id,
             "patient_id": medicine.patient_id,
@@ -33,6 +37,7 @@ def add_medicine(medicine: MedicineCreate, pharmacy_id: str = Header(...)):
             "dosage": medicine.dosage,
             "refill_days": medicine.refill_days,
             "last_purchase_date": medicine.last_purchase_date.isoformat(),
+            "next_due_date": next_due,
             "notes": medicine.notes
         }).execute()
         return result.data[0]
@@ -97,8 +102,26 @@ def update_medicine(medicine_id: str, body: MedicineUpdate, pharmacy_id: str = H
 @router.patch("/{medicine_id}/purchased")
 def mark_purchased(medicine_id: str, body: PurchaseUpdate, pharmacy_id: str = Header(...)):
     try:
+        # FIX: recalculate next_due_date here in Python
+        # This ensures reminders fire on the correct future date after every refill
+        med = supabase.table("medicines")\
+            .select("refill_days")\
+            .eq("id", medicine_id)\
+            .eq("pharmacy_id", pharmacy_id)\
+            .execute()
+
+        if not med.data:
+            raise HTTPException(status_code=404, detail="Medicine not found")
+
+        refill_days = med.data[0]["refill_days"]
+        new_due_date = (body.last_purchase_date + timedelta(days=refill_days)).isoformat()
+
         result = supabase.table("medicines")\
-            .update({"last_purchase_date": body.last_purchase_date.isoformat()})\
+            .update({
+                "last_purchase_date": body.last_purchase_date.isoformat(),
+                "next_due_date": new_due_date,
+                "status": "active"
+            })\
             .eq("id", medicine_id)\
             .eq("pharmacy_id", pharmacy_id)\
             .execute()
@@ -110,6 +133,8 @@ def mark_purchased(medicine_id: str, body: PurchaseUpdate, pharmacy_id: str = He
             .execute()
 
         return result.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -195,6 +220,7 @@ def add_medicines_bulk(body: MedicineBulkCreate, pharmacy_id: str = Header(...))
     try:
         records = []
         for med in body.medicines:
+            next_due = (med.last_purchase_date + timedelta(days=med.refill_days)).isoformat()
             records.append({
                 "pharmacy_id": pharmacy_id,
                 "patient_id": body.patient_id,
@@ -202,6 +228,7 @@ def add_medicines_bulk(body: MedicineBulkCreate, pharmacy_id: str = Header(...))
                 "dosage": med.dosage,
                 "refill_days": med.refill_days,
                 "last_purchase_date": med.last_purchase_date.isoformat(),
+                "next_due_date": next_due,
                 "notes": med.notes
             })
 
