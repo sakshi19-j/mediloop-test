@@ -38,6 +38,31 @@ def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
                 detail="Subscription expired. Please renew to continue."
             )
 
+        # Normalize phone
+        normalized_phone = patient.phone.strip()
+
+        # ── Duplicate phone check ────────────────────────────────────────────
+        # If this phone already belongs to a patient in this pharmacy,
+        # return their record instead of creating a duplicate.
+        # The frontend should detect `already_exists: true` and redirect
+        # to the existing patient's profile page.
+        existing = supabase.table("patients")\
+            .select("*")\
+            .eq("pharmacy_id", pharmacy_id)\
+            .eq("phone", normalized_phone)\
+            .eq("is_deleted", False)\
+            .execute()
+
+        if existing.data:
+            return {
+                **existing.data[0],
+                "already_exists": True,
+                "message": (
+                    f"A patient with phone {normalized_phone} already exists. "
+                    "Any new medicines will be added to their existing profile."
+                )
+            }
+
         sub_limit = supabase.table("subscriptions")\
             .select("patient_limit")\
             .eq("pharmacy_id", pharmacy_id)\
@@ -60,12 +85,12 @@ def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
         result = supabase.table("patients").insert({
             "pharmacy_id": pharmacy_id,
             "name": patient.name,
-            "phone": patient.phone,
+            "phone": normalized_phone,
             "disease_type": patient.disease_type,
             "notes": patient.notes
         }).execute()
 
-        return result.data[0]
+        return {**result.data[0], "already_exists": False}
 
     except HTTPException:
         raise
@@ -73,8 +98,9 @@ def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# IMPORTANT: /export and /import must come BEFORE /{patient_id}
+# IMPORTANT: /export, /import, /lookup must come BEFORE /{patient_id}
 # FastAPI matches routes top-down — a literal path must beat a wildcard
+
 @router.get("/export")
 def export_patients_csv(pharmacy_id: str = Header(...)):
     try:
@@ -114,24 +140,48 @@ async def import_patients_csv(
         reader = csv.DictReader(io.StringIO(decoded))
 
         patients_added = []
+        skipped_duplicates = []
         errors = []
 
         for i, row in enumerate(reader):
             try:
+                phone = row.get("phone", "").strip()
+
+                # Skip rows whose phone already exists in this pharmacy
+                existing = supabase.table("patients")\
+                    .select("id, name")\
+                    .eq("pharmacy_id", pharmacy_id)\
+                    .eq("phone", phone)\
+                    .eq("is_deleted", False)\
+                    .execute()
+
+                if existing.data:
+                    skipped_duplicates.append({
+                        "row": i + 2,
+                        "name": row.get("name"),
+                        "phone": phone,
+                        "existing_patient_id": existing.data[0]["id"],
+                        "existing_name": existing.data[0]["name"]
+                    })
+                    continue
+
                 result = supabase.table("patients").insert({
                     "pharmacy_id": pharmacy_id,
                     "name": row.get("name", "").strip(),
-                    "phone": row.get("phone", "").strip(),
+                    "phone": phone,
                     "disease_type": row.get("disease_type", "Other").strip(),
                     "notes": row.get("notes", "").strip()
                 }).execute()
                 patients_added.append(result.data[0])
+
             except Exception as e:
                 errors.append({"row": i + 2, "name": row.get("name"), "error": str(e)})
 
         return {
             "imported": len(patients_added),
+            "skipped_duplicates": len(skipped_duplicates),
             "failed": len(errors),
+            "duplicates": skipped_duplicates,
             "errors": errors
         }
 
@@ -157,6 +207,32 @@ def handle_opt_out(phone: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/lookup")
+def lookup_by_phone(phone: str, pharmacy_id: str = Header(...)):
+    """
+    Look up a patient by phone number for this pharmacy.
+    Used by the frontend to navigate to the existing patient profile
+    when add_patient returns already_exists: true.
+    """
+    try:
+        result = supabase.table("patients")\
+            .select("*")\
+            .eq("pharmacy_id", pharmacy_id)\
+            .eq("phone", phone.strip())\
+            .eq("is_deleted", False)\
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="No patient found with this phone number")
+
+        return result.data[0]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/")
 def get_patients(
     pharmacy_id: str = Header(...),
@@ -175,7 +251,7 @@ def get_patients(
         if disease_type:
             query = query.eq("disease_type", disease_type)
 
-        # FIX: search pushed into Supabase — works across all patients, not just current page
+        # search pushed into Supabase — works across all patients, not just current page
         if search:
             query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%")
 
@@ -230,6 +306,24 @@ def get_patient_profile(patient_id: str, pharmacy_id: str = Header(...)):
 def update_patient(patient_id: str, body: PatientUpdate, pharmacy_id: str = Header(...)):
     try:
         updates = {k: v for k, v in body.dict().items() if v is not None}
+
+        # If phone is being changed, ensure it's not taken by another patient
+        if "phone" in updates:
+            updates["phone"] = updates["phone"].strip()
+            conflict = supabase.table("patients")\
+                .select("id")\
+                .eq("pharmacy_id", pharmacy_id)\
+                .eq("phone", updates["phone"])\
+                .eq("is_deleted", False)\
+                .neq("id", patient_id)\
+                .execute()
+
+            if conflict.data:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Phone {updates['phone']} is already registered to another patient."
+                )
+
         updates["updated_at"] = "now()"
 
         result = supabase.table("patients")\
