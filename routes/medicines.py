@@ -185,3 +185,34 @@ async def manual_remind(medicine_id: str, pharmacy_id: str = Header(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+class MedicineBulkCreate(BaseModel):
+    patient_id: str
+    medicines: list[MedicineCreate]
+
+@router.post("/bulk")
+def add_medicines_bulk(body: MedicineBulkCreate, pharmacy_id: str = Header(...)):
+    try:
+        records = []
+        for med in body.medicines:
+            records.append({
+                "pharmacy_id": pharmacy_id,
+                "patient_id": body.patient_id,
+                "name": med.name,
+                "dosage": med.dosage,
+                "refill_days": med.refill_days,
+                "last_purchase_date": med.last_purchase_date.isoformat(),
+                "notes": med.notes
+            })
+
+        result = supabase.table("medicines")\
+            .insert(records)\
+            .execute()
+
+        return {
+            "added": len(result.data),
+            "medicines": result.data
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -202,3 +202,78 @@ def handle_opt_out(phone: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+from fastapi import UploadFile, File
+from fastapi.responses import StreamingResponse
+import csv
+import io
+
+@router.post("/import")
+async def import_patients_csv(
+    file: UploadFile = File(...),
+    pharmacy_id: str = Header(...)
+):
+    try:
+        content = await file.read()
+        decoded = content.decode("utf-8")
+        reader = csv.DictReader(io.StringIO(decoded))
+
+        patients_added = []
+        errors = []
+
+        for i, row in enumerate(reader):
+            try:
+                result = supabase.table("patients").insert({
+                    "pharmacy_id": pharmacy_id,
+                    "name": row.get("name", "").strip(),
+                    "phone": row.get("phone", "").strip(),
+                    "disease_type": row.get("disease_type", "Other").strip(),
+                    "notes": row.get("notes", "").strip()
+                }).execute()
+                patients_added.append(result.data[0])
+            except Exception as e:
+                errors.append({
+                    "row": i + 2,
+                    "name": row.get("name"),
+                    "error": str(e)
+                })
+
+        return {
+            "imported": len(patients_added),
+            "failed": len(errors),
+            "errors": errors
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/export")
+def export_patients_csv(pharmacy_id: str = Header(...)):
+    try:
+        result = supabase.table("patients")\
+            .select("name, phone, disease_type, notes, created_at")\
+            .eq("pharmacy_id", pharmacy_id)\
+            .eq("is_deleted", False)\
+            .execute()
+
+        output = io.StringIO()
+        writer = csv.DictWriter(
+            output,
+            fieldnames=["name", "phone", "disease_type", "notes", "created_at"]
+        )
+        writer.writeheader()
+        writer.writerows(result.data)
+
+        output.seek(0)
+
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode()),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": "attachment; filename=patients_export.csv"
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

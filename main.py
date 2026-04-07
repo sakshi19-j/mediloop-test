@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from scheduler import start_scheduler
-from routes import auth, patients, medicines, dashboard, billing
+from routes import auth, patients, medicines, dashboard, billing, prescriptions
 
 app = FastAPI(
     title="MediLoop API",
@@ -22,6 +22,7 @@ app.include_router(patients.router, prefix="/api/v1/patients", tags=["Patients"]
 app.include_router(medicines.router, prefix="/api/v1/medicines", tags=["Medicines"])
 app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["Dashboard"])
 app.include_router(billing.router, prefix="/api/v1/billing", tags=["Billing"])
+app.include_router(prescriptions.router, prefix="/api/v1/prescriptions", tags=["Prescriptions"])
 
 @app.on_event("startup")
 async def startup():
