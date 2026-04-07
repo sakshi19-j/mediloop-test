@@ -21,6 +21,18 @@ class PatientUpdate(BaseModel):
 @router.post("/")
 def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
     try:
+
+        # Check subscription is active
+        sub = supabase.table("subscriptions")\
+            .select("status, plan")\
+            .eq("pharmacy_id", pharmacy_id)\
+            .execute()
+
+        if sub.data and sub.data[0]["status"] == "expired":
+            raise HTTPException(
+            status_code=402,
+            detail="Subscription expired. Please renew to continue."
+        )
         # Check plan limit
         sub = supabase.table("subscriptions")\
             .select("patient_limit")\

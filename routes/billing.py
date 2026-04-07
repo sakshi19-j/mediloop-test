@@ -111,3 +111,37 @@ def get_subscription(pharmacy_id: str = Header(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/renew")
+def renew_subscription(
+    razorpay_payment_id: str,
+    razorpay_order_id: str,
+    razorpay_signature: str,
+    plan: str,
+    pharmacy_id: str = Header(...)
+):
+    try:
+        client = get_razorpay_client()
+        client.utility.verify_payment_signature({
+            "razorpay_order_id": razorpay_order_id,
+            "razorpay_payment_id": razorpay_payment_id,
+            "razorpay_signature": razorpay_signature
+        })
+
+        from datetime import datetime, timedelta
+        new_end = (datetime.utcnow() + timedelta(days=30)).isoformat()
+
+        supabase.table("subscriptions")\
+            .update({
+                "status": "active",
+                "ends_at": new_end,
+                "next_billing_date": (datetime.utcnow() + timedelta(days=30)).date().isoformat(),
+                "razorpay_payment_id": razorpay_payment_id
+            })\
+            .eq("pharmacy_id", pharmacy_id)\
+            .execute()
+
+        return {"message": "Subscription renewed", "next_billing": new_end}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

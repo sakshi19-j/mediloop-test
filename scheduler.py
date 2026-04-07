@@ -104,6 +104,28 @@ async def retry_failed_reminders():
             .update({"whatsapp_status": f"retry_{result['channel']}"})\
             .eq("id", log["id"])\
             .execute()
+        
+
+async def check_subscription_expiry():
+    from datetime import date
+    today = date.today().isoformat()
+
+    # Find subscriptions that expired
+    expired = supabase.table("subscriptions")\
+        .select("*, pharmacies(name, email)")\
+        .eq("status", "active")\
+        .lt("ends_at", today)\
+        .neq("plan", "trial")\
+        .execute()
+
+    for sub in expired.data:
+        # Mark as expired
+        supabase.table("subscriptions")\
+            .update({"status": "expired"})\
+            .eq("id", sub["id"])\
+            .execute()
+
+        print(f"[Billing] Subscription expired: {sub['pharmacies']['name']}")
 
 def start_scheduler():
     # Main job at 9am
@@ -122,6 +144,14 @@ def start_scheduler():
         hour=11,
         minute=0,
         id="retry_failed"
+    )
+
+    scheduler.add_job(
+        lambda: asyncio.create_task(check_subscription_expiry()),
+        trigger="cron",
+        hour=0,
+        minute=0,
+        id="check_expiry"
     )
 
     scheduler.start()
