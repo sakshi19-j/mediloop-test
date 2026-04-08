@@ -24,6 +24,13 @@ class PatientUpdate(BaseModel):
     notes: Optional[str] = None
 
 
+def normalize_phone(phone: str) -> str:
+    phone = phone.strip().lstrip("+").replace(" ", "").replace("-", "")
+    if not phone.startswith("91") and len(phone) == 10:
+        phone = f"91{phone}"
+    return phone
+
+
 @router.post("/")
 def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
     try:
@@ -38,14 +45,8 @@ def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
                 detail="Subscription expired. Please renew to continue."
             )
 
-        # Normalize phone
-        normalized_phone = patient.phone.strip()
+        normalized_phone = normalize_phone(patient.phone)
 
-        # ── Duplicate phone check ────────────────────────────────────────────
-        # If this phone already belongs to a patient in this pharmacy,
-        # return their record instead of creating a duplicate.
-        # The frontend should detect `already_exists: true` and redirect
-        # to the existing patient's profile page.
         existing = supabase.table("patients")\
             .select("*")\
             .eq("pharmacy_id", pharmacy_id)\
@@ -98,9 +99,6 @@ def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# IMPORTANT: /export, /import, /lookup must come BEFORE /{patient_id}
-# FastAPI matches routes top-down — a literal path must beat a wildcard
-
 @router.get("/export")
 def export_patients_csv(pharmacy_id: str = Header(...)):
     try:
@@ -145,9 +143,8 @@ async def import_patients_csv(
 
         for i, row in enumerate(reader):
             try:
-                phone = row.get("phone", "").strip()
+                phone = normalize_phone(row.get("phone", ""))
 
-                # Skip rows whose phone already exists in this pharmacy
                 existing = supabase.table("patients")\
                     .select("id, name")\
                     .eq("pharmacy_id", pharmacy_id)\
@@ -192,15 +189,16 @@ async def import_patients_csv(
 @router.post("/opt-out")
 def handle_opt_out(phone: str):
     try:
+        normalized = normalize_phone(phone)
         supabase.table("patients")\
             .update({
                 "opted_out": True,
                 "opted_out_at": datetime.utcnow().isoformat()
             })\
-            .eq("phone", phone)\
+            .eq("phone", normalized)\
             .execute()
 
-        supabase.table("opt_outs").upsert({"phone": phone}).execute()
+        supabase.table("opt_outs").upsert({"phone": normalized}).execute()
         return {"message": "Opted out successfully"}
 
     except Exception as e:
@@ -209,16 +207,12 @@ def handle_opt_out(phone: str):
 
 @router.get("/lookup")
 def lookup_by_phone(phone: str, pharmacy_id: str = Header(...)):
-    """
-    Look up a patient by phone number for this pharmacy.
-    Used by the frontend to navigate to the existing patient profile
-    when add_patient returns already_exists: true.
-    """
     try:
+        normalized = normalize_phone(phone)
         result = supabase.table("patients")\
             .select("*")\
             .eq("pharmacy_id", pharmacy_id)\
-            .eq("phone", phone.strip())\
+            .eq("phone", normalized)\
             .eq("is_deleted", False)\
             .execute()
 
@@ -251,7 +245,6 @@ def get_patients(
         if disease_type:
             query = query.eq("disease_type", disease_type)
 
-        # search pushed into Supabase — works across all patients, not just current page
         if search:
             query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%")
 
@@ -307,9 +300,8 @@ def update_patient(patient_id: str, body: PatientUpdate, pharmacy_id: str = Head
     try:
         updates = {k: v for k, v in body.dict().items() if v is not None}
 
-        # If phone is being changed, ensure it's not taken by another patient
         if "phone" in updates:
-            updates["phone"] = updates["phone"].strip()
+            updates["phone"] = normalize_phone(updates["phone"])
             conflict = supabase.table("patients")\
                 .select("id")\
                 .eq("pharmacy_id", pharmacy_id)\

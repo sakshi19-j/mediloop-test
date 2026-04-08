@@ -13,13 +13,20 @@ WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
 META_API_URL = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
 
 
+def normalize_phone(phone: str) -> str:
+    phone = phone.strip().lstrip("+").replace(" ", "").replace("-", "")
+    if not phone.startswith("91") and len(phone) == 10:
+        phone = f"91{phone}"
+    return phone
+
+
 async def send_reminder(
     phone: str,
     patient_name: str,
     medicine_name: str,
     pharmacy_name: str,
 ) -> dict:
-    phone = phone.strip().lstrip("+").replace(" ", "").replace("-", "")
+    phone = normalize_phone(phone)
 
     if not WHATSAPP_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
         logger.error("META credentials not set in .env")

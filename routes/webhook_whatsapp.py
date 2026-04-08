@@ -11,10 +11,9 @@ from database import supabase
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Webhooks"])
 
-WHATSAPP_VERIFY_TOKEN = "mediloop_verify"  # Must match Meta dashboard
+WHATSAPP_VERIFY_TOKEN = "mediloop_verify"
 
 
-# ── 1. Webhook verification (Meta sends GET on setup) ─────────────────────────
 @router.get("/webhook/whatsapp")
 async def whatsapp_verify(
     hub_mode: str = Query(None, alias="hub.mode"),
@@ -24,12 +23,10 @@ async def whatsapp_verify(
     if hub_mode == "subscribe" and hub_verify_token == WHATSAPP_VERIFY_TOKEN:
         logger.info("[Webhook] Meta verification successful")
         return PlainTextResponse(content=hub_challenge, status_code=200)
-
     logger.warning("[Webhook] Meta verification failed")
     return PlainTextResponse(content="Forbidden", status_code=403)
 
 
-# ── 2. Incoming messages (Meta sends POST for real events) ────────────────────
 @router.post("/webhook/whatsapp")
 async def whatsapp_reply_webhook(request: Request):
     try:
@@ -39,8 +36,6 @@ async def whatsapp_reply_webhook(request: Request):
 
     logger.info(f"[Webhook] Meta payload: {payload}")
 
-    # ── Parse Meta Cloud API payload structure ─────────────────────────────
-    # Meta wraps messages inside: entry[0].changes[0].value.messages[0]
     try:
         entry = payload.get("entry", [{}])[0]
         change = entry.get("changes", [{}])[0]
@@ -61,63 +56,116 @@ async def whatsapp_reply_webhook(request: Request):
     if not phone or not raw_message:
         return {"status": "ok", "note": "empty payload ignored"}
 
+    # Normalize phone — try both with and without country code
+    phone_variants = [phone, phone.lstrip("91")] if phone.startswith("91") else [phone, f"91{phone}"]
+
     logger.info(f"[Webhook] From: {phone} | Message: {raw_message}")
 
     # ── Opt-out ────────────────────────────────────────────────────────────
     if raw_message in ["STOP", "UNSUBSCRIBE", "CANCEL", "QUIT", "NO MORE"]:
         try:
-            supabase.table("patients").update({"opted_out": True}).eq("phone", phone).execute()
+            for p in phone_variants:
+                supabase.table("patients").update({"opted_out": True}).eq("phone", p).execute()
             supabase.table("opt_outs").upsert({"phone": phone}).execute()
             logger.info(f"[Webhook] Opted out: {phone}")
         except Exception as e:
             logger.error(f"[Webhook] Opt-out DB error: {e}")
         return {"status": "ok", "action": "opted_out"}
 
+    # ── Fetch patient (try phone variants) ────────────────────────────────
+    patient = None
+    for p in phone_variants:
+        try:
+            result = supabase.table("patients") \
+                .select("id, name, pharmacy_id") \
+                .eq("phone", p) \
+                .eq("opted_out", False) \
+                .eq("is_deleted", False) \
+                .single() \
+                .execute()
+            if result.data:
+                patient = result.data
+                break
+        except Exception:
+            continue
+
+    if not patient:
+        logger.warning(f"[Webhook] No patient found for {phone}")
+        return {"status": "ok", "action": "patient_not_found"}
+
+    # ── Fetch the single most recent pending reminder log ─────────────────
+    log = None
+    try:
+        log_result = supabase.table("reminder_logs") \
+            .select("id, medicine_id") \
+            .eq("patient_id", patient["id"]) \
+            .eq("patient_replied", False) \
+            .order("sent_at", desc=True) \
+            .limit(1) \
+            .execute()
+        if log_result.data:
+            log = log_result.data[0]
+    except Exception as e:
+        logger.error(f"[Webhook] Log fetch error: {e}")
+
     # ── YES — reorder ──────────────────────────────────────────────────────
     if raw_message in ["YES", "Y", "1", "HA", "HAN", "HAA"]:
+        if not log:
+            return {"status": "ok", "action": "no_pending_reminder"}
+
         try:
-            patient_result = supabase.table("patients") \
-                .select("id, name, pharmacy_id") \
-                .eq("phone", phone).eq("opted_out", False).single().execute()
+            # Guard against duplicate reorder on same log
+            already = supabase.table("reminder_logs") \
+                .select("id") \
+                .eq("id", log["id"]) \
+                .eq("patient_replied", True) \
+                .execute()
 
-            if not patient_result.data:
-                return {"status": "ok", "action": "patient_not_found"}
+            if already.data:
+                logger.warning(f"[Webhook] Duplicate YES ignored for log {log['id']}")
+                return {"status": "ok", "action": "duplicate_ignored"}
 
-            patient = patient_result.data
-            log_result = supabase.table("reminder_logs") \
-                .select("id, medicine_id") \
-                .eq("patient_id", patient["id"]).eq("patient_replied", False) \
-                .order("sent_at", desc=True).limit(1).execute()
+            supabase.table("reminder_logs").update({
+                "patient_replied": True,
+                "reply": "YES"
+            }).eq("id", log["id"]).execute()
 
-            if log_result.data:
-                log = log_result.data[0]
-                supabase.table("reminder_logs").update(
-                    {"patient_replied": True, "reply": "YES"}
-                ).eq("id", log["id"]).execute()
+            supabase.table("medicines").update({
+                "status": "reorder_requested"
+            }).eq("id", log["medicine_id"]).execute()
 
-                supabase.table("medicines").update(
-                    {"status": "reorder_requested"}
-                ).eq("id", log["medicine_id"]).execute()
+            # Notify pharmacy via a reorder_requests table so dashboard can show it
+            supabase.table("reorder_requests").insert({
+                "medicine_id": log["medicine_id"],
+                "patient_id": patient["id"],
+                "pharmacy_id": patient["pharmacy_id"],
+                "reminder_log_id": log["id"],
+                "status": "pending"
+            }).execute()
 
-                logger.info(f"[Webhook] Reorder — patient: {patient['name']}")
+            logger.info(f"[Webhook] Reorder created — patient: {patient['name']}, medicine: {log['medicine_id']}")
+
         except Exception as e:
             logger.error(f"[Webhook] YES handler error: {e}")
+
         return {"status": "ok", "action": "reorder_requested"}
 
     # ── NO — skip ──────────────────────────────────────────────────────────
     if raw_message in ["NO", "N", "2", "NAI", "NAHI"]:
+        if not log:
+            return {"status": "ok", "action": "no_pending_reminder"}
+
         try:
-            patient_result = supabase.table("patients") \
-                .select("id").eq("phone", phone).single().execute()
+            supabase.table("reminder_logs").update({
+                "patient_replied": True,
+                "reply": "NO"
+            }).eq("id", log["id"]).execute()
 
-            if patient_result.data:
-                supabase.table("reminder_logs").update(
-                    {"patient_replied": True, "reply": "NO"}
-                ).eq("patient_id", patient_result.data["id"]).eq("patient_replied", False).execute()
+            logger.info(f"[Webhook] Skipped by patient: {phone}")
 
-                logger.info(f"[Webhook] Skipped: {phone}")
         except Exception as e:
             logger.error(f"[Webhook] NO handler error: {e}")
+
         return {"status": "ok", "action": "skipped"}
 
     logger.info(f"[Webhook] Unrecognised reply from {phone}: '{raw_message}'")
