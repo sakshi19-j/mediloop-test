@@ -71,8 +71,8 @@ async def whatsapp_reply_webhook(request: Request):
             logger.error(f"[Webhook] Opt-out DB error: {e}")
         return {"status": "ok", "action": "opted_out"}
 
-    # ── Fetch patient ──────────────────────────────────────────────────────
-    patient = None
+    # ── Fetch ALL patients matching phone ──────────────────────────────────
+    all_patients = []
     for p in phone_variants:
         try:
             result = supabase.table("patients") \
@@ -80,44 +80,57 @@ async def whatsapp_reply_webhook(request: Request):
                 .eq("phone", p) \
                 .eq("opted_out", False) \
                 .eq("is_deleted", False) \
-                .limit(1) \
                 .execute()
             data = result.data
-            if isinstance(data, list) and len(data) > 0:
-                patient = data[0]
-                break
-            elif isinstance(data, dict) and data.get("id"):
-                patient = data
-                break
+            if isinstance(data, list):
+                all_patients.extend(data)
         except Exception as e:
             logger.error(f"[Webhook] Patient lookup error for {p}: {e}")
             continue
 
-    if not patient:
+    # Deduplicate by patient id
+    seen_ids = set()
+    unique_patients = []
+    for pat in all_patients:
+        if pat["id"] not in seen_ids:
+            seen_ids.add(pat["id"])
+            unique_patients.append(pat)
+
+    if not unique_patients:
         logger.warning(f"[Webhook] No patient found for {phone}")
         return {"status": "ok", "action": "patient_not_found"}
 
-    # ── Fetch most recent pending reminder log ─────────────────────────────
-    log = None
-    try:
-        log_result = supabase.table("reminder_logs") \
-            .select("id, medicine_id") \
-            .eq("patient_id", patient["id"]) \
-            .eq("patient_replied", False) \
-            .order("sent_at", desc=True) \
-            .limit(1) \
-            .execute()
-        data = log_result.data
-        if isinstance(data, list) and len(data) > 0:
-            log = data[0]
-        elif isinstance(data, dict) and data.get("id"):
-            log = data
-    except Exception as e:
-        logger.error(f"[Webhook] Log fetch error: {e}")
+    # ── Find the patient with the most recent pending reminder log ─────────
+    best_log = None
+    best_patient = None
+
+    for pat in unique_patients:
+        try:
+            log_result = supabase.table("reminder_logs") \
+                .select("id, medicine_id, sent_at") \
+                .eq("patient_id", pat["id"]) \
+                .eq("patient_replied", False) \
+                .order("sent_at", desc=True) \
+                .limit(1) \
+                .execute()
+            data = log_result.data
+            log = None
+            if isinstance(data, list) and len(data) > 0:
+                log = data[0]
+            elif isinstance(data, dict) and data.get("id"):
+                log = data
+
+            if log:
+                if best_log is None or log["sent_at"] > best_log["sent_at"]:
+                    best_log = log
+                    best_patient = pat
+        except Exception as e:
+            logger.error(f"[Webhook] Log fetch error for patient {pat['id']}: {e}")
+            continue
 
     # ── YES ────────────────────────────────────────────────────────────────
     if raw_message in ["YES", "Y", "1", "HA", "HAN", "HAA"]:
-        if not log:
+        if not best_log:
             logger.warning(f"[Webhook] No pending log for {phone}")
             return {"status": "ok", "action": "no_pending_reminder"}
 
@@ -125,21 +138,21 @@ async def whatsapp_reply_webhook(request: Request):
             supabase.table("reminder_logs").update({
                 "patient_replied": True,
                 "reply": "YES"
-            }).eq("id", log["id"]).execute()
+            }).eq("id", best_log["id"]).execute()
 
             supabase.table("medicines").update({
                 "status": "reorder_requested"
-            }).eq("id", log["medicine_id"]).execute()
+            }).eq("id", best_log["medicine_id"]).execute()
 
             supabase.table("reorder_requests").insert({
-                "medicine_id": log["medicine_id"],
-                "patient_id": patient["id"],
-                "pharmacy_id": patient["pharmacy_id"],
-                "reminder_log_id": log["id"],
+                "medicine_id": best_log["medicine_id"],
+                "patient_id": best_patient["id"],
+                "pharmacy_id": best_patient["pharmacy_id"],
+                "reminder_log_id": best_log["id"],
                 "status": "pending"
             }).execute()
 
-            logger.info(f"[Webhook] Reorder created — patient: {patient['name']}, medicine: {log['medicine_id']}")
+            logger.info(f"[Webhook] Reorder created — patient: {best_patient['name']}, medicine: {best_log['medicine_id']}")
 
         except Exception as e:
             logger.error(f"[Webhook] YES handler error: {e}")
@@ -148,14 +161,14 @@ async def whatsapp_reply_webhook(request: Request):
 
     # ── NO ─────────────────────────────────────────────────────────────────
     if raw_message in ["NO", "N", "2", "NAI", "NAHI"]:
-        if not log:
+        if not best_log:
             return {"status": "ok", "action": "no_pending_reminder"}
 
         try:
             supabase.table("reminder_logs").update({
                 "patient_replied": True,
                 "reply": "NO"
-            }).eq("id", log["id"]).execute()
+            }).eq("id", best_log["id"]).execute()
 
             logger.info(f"[Webhook] Skipped by patient: {phone}")
 
