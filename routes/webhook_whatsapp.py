@@ -103,8 +103,11 @@ async def whatsapp_reply_webhook(request: Request):
             .order("sent_at", desc=True) \
             .limit(1) \
             .execute()
-        if log_result.data:
-            log = log_result.data[0]
+        data = log_result.data
+        if isinstance(data, list) and len(data) > 0:
+            log = data[0]
+        elif isinstance(data, dict):
+            log = data
     except Exception as e:
         logger.error(f"[Webhook] Log fetch error: {e}")
 
