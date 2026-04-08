@@ -81,7 +81,7 @@ async def whatsapp_reply_webhook(request: Request):
                 .eq("phone", p) \
                 .eq("opted_out", False) \
                 .eq("is_deleted", False) \
-                .single() \
+                .limit(1) \
                 .execute()
             if result.data:
                 patient = result.data
