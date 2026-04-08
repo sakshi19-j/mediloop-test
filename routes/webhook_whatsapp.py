@@ -56,7 +56,6 @@ async def whatsapp_reply_webhook(request: Request):
     if not phone or not raw_message:
         return {"status": "ok", "note": "empty payload ignored"}
 
-    # Normalize phone — try both with and without country code
     phone_variants = [phone, phone.lstrip("91")] if phone.startswith("91") else [phone, f"91{phone}"]
 
     logger.info(f"[Webhook] From: {phone} | Message: {raw_message}")
@@ -72,7 +71,7 @@ async def whatsapp_reply_webhook(request: Request):
             logger.error(f"[Webhook] Opt-out DB error: {e}")
         return {"status": "ok", "action": "opted_out"}
 
-    # ── Fetch patient (try phone variants) ────────────────────────────────
+    # ── Fetch patient ──────────────────────────────────────────────────────
     patient = None
     for p in phone_variants:
         try:
@@ -83,17 +82,22 @@ async def whatsapp_reply_webhook(request: Request):
                 .eq("is_deleted", False) \
                 .limit(1) \
                 .execute()
-            if result.data:
-                patient = result.data
+            data = result.data
+            if isinstance(data, list) and len(data) > 0:
+                patient = data[0]
                 break
-        except Exception:
+            elif isinstance(data, dict) and data.get("id"):
+                patient = data
+                break
+        except Exception as e:
+            logger.error(f"[Webhook] Patient lookup error for {p}: {e}")
             continue
 
     if not patient:
         logger.warning(f"[Webhook] No patient found for {phone}")
         return {"status": "ok", "action": "patient_not_found"}
 
-    # ── Fetch the single most recent pending reminder log ─────────────────
+    # ── Fetch most recent pending reminder log ─────────────────────────────
     log = None
     try:
         log_result = supabase.table("reminder_logs") \
@@ -106,28 +110,18 @@ async def whatsapp_reply_webhook(request: Request):
         data = log_result.data
         if isinstance(data, list) and len(data) > 0:
             log = data[0]
-        elif isinstance(data, dict):
+        elif isinstance(data, dict) and data.get("id"):
             log = data
     except Exception as e:
         logger.error(f"[Webhook] Log fetch error: {e}")
 
-    # ── YES — reorder ──────────────────────────────────────────────────────
+    # ── YES ────────────────────────────────────────────────────────────────
     if raw_message in ["YES", "Y", "1", "HA", "HAN", "HAA"]:
         if not log:
+            logger.warning(f"[Webhook] No pending log for {phone}")
             return {"status": "ok", "action": "no_pending_reminder"}
 
         try:
-            # Guard against duplicate reorder on same log
-            already = supabase.table("reminder_logs") \
-                .select("id") \
-                .eq("id", log["id"]) \
-                .eq("patient_replied", True) \
-                .execute()
-
-            if already.data:
-                logger.warning(f"[Webhook] Duplicate YES ignored for log {log['id']}")
-                return {"status": "ok", "action": "duplicate_ignored"}
-
             supabase.table("reminder_logs").update({
                 "patient_replied": True,
                 "reply": "YES"
@@ -137,7 +131,6 @@ async def whatsapp_reply_webhook(request: Request):
                 "status": "reorder_requested"
             }).eq("id", log["medicine_id"]).execute()
 
-            # Notify pharmacy via a reorder_requests table so dashboard can show it
             supabase.table("reorder_requests").insert({
                 "medicine_id": log["medicine_id"],
                 "patient_id": patient["id"],
@@ -153,7 +146,7 @@ async def whatsapp_reply_webhook(request: Request):
 
         return {"status": "ok", "action": "reorder_requested"}
 
-    # ── NO — skip ──────────────────────────────────────────────────────────
+    # ── NO ─────────────────────────────────────────────────────────────────
     if raw_message in ["NO", "N", "2", "NAI", "NAHI"]:
         if not log:
             return {"status": "ok", "action": "no_pending_reminder"}
