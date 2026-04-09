@@ -312,3 +312,44 @@ def add_medicines_bulk(body: MedicineBulkCreate, pharmacy_id: str = Header(...))
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@router.get("/journeys")
+def get_journeys(
+    pharmacy_id: str = Header(...),
+    status: Optional[str] = None
+):
+    try:
+        query = supabase.table("journeys") \
+            .select("*, patients(name), medicines(name)") \
+            .eq("pharmacy_id", pharmacy_id) \
+            .order("start_date", desc=True)
+
+        if status:
+            query = query.eq("status", status)
+
+        result = query.execute()
+
+        data = result.data
+        total = len(data)
+        confirmed = sum(1 for j in data if j["conversion_flag"] == 1)
+        no_reply = sum(1 for j in data if j["status"] == "expired" and j["conversion_flag"] == 0)
+
+        skipped_result = supabase.table("reminder_logs") \
+            .select("journey_id") \
+            .eq("pharmacy_id", pharmacy_id) \
+            .eq("reply", "NO") \
+            .execute()
+        skipped = len(skipped_result.data)
+
+        return {
+            "stats": {
+                "total_journeys": total,
+                "confirmed": confirmed,
+                "no_reply": no_reply,
+                "skipped": skipped
+            },
+            "journeys": data
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
