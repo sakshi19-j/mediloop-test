@@ -1,4 +1,3 @@
-from routes import stats
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from scheduler import start_scheduler
@@ -25,7 +24,6 @@ app.include_router(medicines.router, prefix="/api/v1/medicines", tags=["Medicine
 app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["Dashboard"])
 app.include_router(billing.router, prefix="/api/v1/billing", tags=["Billing"])
 app.include_router(prescriptions.router, prefix="/api/v1/prescriptions", tags=["Prescriptions"])
-app.include_router(stats.router, prefix="/api/v1", tags=["Stats"])
 app.include_router(whatsapp_webhook_router)
 
 @app.on_event("startup")
