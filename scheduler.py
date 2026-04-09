@@ -7,15 +7,34 @@ import asyncio
 import pytz
 
 scheduler = AsyncIOScheduler()
-
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def get_or_create_journey(medicine_id: str, patient_id: str, pharmacy_id: str) -> str:
+    """Return existing active journey_id or create a new one."""
+    existing = supabase.table("journeys") \
+        .select("id") \
+        .eq("medicine_id", medicine_id) \
+        .eq("status", "active") \
+        .execute()
+
+    if existing.data:
+        return existing.data[0]["id"]
+
+    new_journey = supabase.table("journeys").insert({
+        "medicine_id": medicine_id,
+        "patient_id": patient_id,
+        "pharmacy_id": pharmacy_id,
+        "start_date": date.today().isoformat(),
+        "status": "active",
+        "total_reminders_sent": 0,
+        "conversion_flag": 0
+    }).execute()
+
+    return new_journey.data[0]["id"]
+
+
 async def send_reminders_for_offset(days_offset: int, reminder_type: str):
-    """
-    Generic reminder sender for any day offset.
-    reminder_type: '3day', '1day', '2day' etc — used to avoid duplicate sends.
-    """
     target_date = (date.today() + timedelta(days=days_offset)).isoformat()
     print(f"[Scheduler] [{reminder_type}] Running for due date: {target_date}")
 
@@ -42,7 +61,7 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
             skipped += 1
             continue
 
-        # Skip if this reminder_type was already successfully sent today for this medicine
+        # Skip if this reminder_type was already sent today for this medicine
         existing = supabase.table("reminder_logs") \
             .select("id") \
             .eq("medicine_id", med["id"]) \
@@ -55,6 +74,9 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
             print(f"[Scheduler] [{reminder_type}] Already sent today for medicine {med['id']}, skipping")
             skipped += 1
             continue
+
+        # Get or create journey for this medicine cycle
+        journey_id = get_or_create_journey(med["id"], med["patient_id"], med["pharmacy_id"])
 
         result = await send_reminder(
             phone=patient["phone"],
@@ -71,7 +93,15 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
             "pharmacy_id": med["pharmacy_id"],
             "whatsapp_status": log_status,
             "reminder_type": reminder_type,
+            "journey_id": journey_id,
         }).execute()
+
+        # Increment reminder count on journey
+        journey = supabase.table("journeys").select("total_reminders_sent").eq("id", journey_id).execute()
+        current_count = journey.data[0]["total_reminders_sent"] if journey.data else 0
+        supabase.table("journeys").update({
+            "total_reminders_sent": current_count + 1
+        }).eq("id", journey_id).execute()
 
         if log_status != "failed":
             print(f"[Scheduler] [{reminder_type}] Sent to {patient['name']} for {med['name']}")
@@ -83,23 +113,46 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
     print(f"[Scheduler] [{reminder_type}] Done — sent: {sent}, skipped: {skipped}, failed: {failed}")
 
 
+async def expire_old_journeys():
+    """Mark journeys with no YES reply after due date as expired."""
+    today = date.today().isoformat()
+
+    active_journeys = supabase.table("journeys") \
+        .select("id, medicine_id") \
+        .eq("status", "active") \
+        .execute()
+
+    for journey in active_journeys.data:
+        med = supabase.table("medicines") \
+            .select("next_due_date") \
+            .eq("id", journey["medicine_id"]) \
+            .execute()
+
+        if not med.data:
+            continue
+
+        due_date = med.data[0]["next_due_date"]
+        if due_date and due_date < today:
+            supabase.table("journeys").update({
+                "status": "expired",
+                "conversion_flag": 0
+            }).eq("id", journey["id"]).execute()
+            print(f"[Scheduler] Journey {journey['id']} expired")
+
+
 async def send_3day_reminders():
-    """Fires at 9am — medicines due in 3 days"""
     await send_reminders_for_offset(3, "3day")
 
 
 async def send_1day_reminders():
-    """Fires at 9am — medicines due tomorrow (24hrs before)"""
     await send_reminders_for_offset(1, "1day")
 
 
 async def send_due_reminders():
-    """Fires at 9am — medicines due in 2 days (existing behaviour kept)"""
     await send_reminders_for_offset(2, "2day")
 
 
 async def retry_failed_reminders():
-    """Runs 2 hours after main job to retry any failures from today"""
     today = date.today().isoformat()
 
     failed = supabase.table("reminder_logs") \
@@ -156,35 +209,31 @@ async def check_subscription_expiry():
 
 
 def start_scheduler():
-    # 3 days before due — 9am IST
     scheduler.add_job(
         lambda: asyncio.create_task(send_3day_reminders()),
         trigger=CronTrigger(hour=9, minute=0, timezone=IST),
         id="reminders_3day"
     )
-
-    # 2 days before due — 9am IST (existing)
     scheduler.add_job(
         lambda: asyncio.create_task(send_due_reminders()),
         trigger=CronTrigger(hour=9, minute=5, timezone=IST),
         id="reminders_2day"
     )
-
-    # 1 day before due (24hrs) — 9am IST
     scheduler.add_job(
         lambda: asyncio.create_task(send_1day_reminders()),
         trigger=CronTrigger(hour=9, minute=10, timezone=IST),
         id="reminders_1day"
     )
-
-    # Retry failures at 11am IST
     scheduler.add_job(
         lambda: asyncio.create_task(retry_failed_reminders()),
         trigger=CronTrigger(hour=11, minute=0, timezone=IST),
         id="retry_failed"
     )
-
-    # Subscription expiry check at midnight IST
+    scheduler.add_job(
+        lambda: asyncio.create_task(expire_old_journeys()),
+        trigger=CronTrigger(hour=0, minute=30, timezone=IST),
+        id="expire_journeys"
+    )
     scheduler.add_job(
         lambda: asyncio.create_task(check_subscription_expiry()),
         trigger=CronTrigger(hour=0, minute=0, timezone=IST),
@@ -192,4 +241,4 @@ def start_scheduler():
     )
 
     scheduler.start()
-    print("[Scheduler] Started — 3day/2day/1day reminders at 9am IST, retry at 11am IST")
+    print("[Scheduler] Started")

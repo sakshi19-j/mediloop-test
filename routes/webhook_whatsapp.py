@@ -129,6 +129,7 @@ async def whatsapp_reply_webhook(request: Request):
             continue
 
     # ── YES ────────────────────────────────────────────────────────────────
+    # ── YES ────────────────────────────────────────────────────────────────
     if raw_message in ["YES", "Y", "1", "HA", "HAN", "HAA"]:
         if not best_log:
             logger.warning(f"[Webhook] No pending log for {phone}")
@@ -152,13 +153,20 @@ async def whatsapp_reply_webhook(request: Request):
                 "status": "pending"
             }).execute()
 
+            # Mark journey as completed + conversion success
+            if best_log.get("journey_id"):
+                supabase.table("journeys").update({
+                    "status": "completed",
+                    "conversion_flag": 1
+                }).eq("id", best_log["journey_id"]).execute()
+
             logger.info(f"[Webhook] Reorder created — patient: {best_patient['name']}, medicine: {best_log['medicine_id']}")
 
         except Exception as e:
             logger.error(f"[Webhook] YES handler error: {e}")
 
         return {"status": "ok", "action": "reorder_requested"}
-
+    
     # ── NO ─────────────────────────────────────────────────────────────────
     if raw_message in ["NO", "N", "2", "NAI", "NAHI"]:
         if not best_log:
