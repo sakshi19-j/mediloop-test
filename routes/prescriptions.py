@@ -1,11 +1,27 @@
 from fastapi import APIRouter, HTTPException, Header, UploadFile, File
+from pydantic import BaseModel
 from database import supabase
-import anthropic
+from openai import OpenAI
 import base64
 import os
 import json
+from datetime import date
+from typing import List, Optional
 
 router = APIRouter()
+
+
+class MedicineConfirm(BaseModel):
+    name: str
+    dosage: Optional[str] = "as prescribed"
+    refill_days: Optional[int] = 30
+    instructions: Optional[str] = ""
+
+
+class ConfirmRequest(BaseModel):
+    patient_id: str
+    medicines: List[MedicineConfirm]
+
 
 @router.post("/read")
 async def read_prescription(
@@ -14,29 +30,23 @@ async def read_prescription(
     pharmacy_id: str = Header(...)
 ):
     try:
-        # Read image file
         image_data = await file.read()
         base64_image = base64.b64encode(image_data).decode("utf-8")
-
-        # Determine media type
         content_type = file.content_type or "image/jpeg"
 
-        # Call Claude to read prescription
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-        message = client.messages.create(
-            model="claude-opus-4-5",
+        message = client.chat.completions.create(
+            model="gpt-4o-mini",
             max_tokens=1024,
             messages=[
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": content_type,
-                                "data": base64_image
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{content_type};base64,{base64_image}"
                             }
                         },
                         {
@@ -64,10 +74,8 @@ Rules:
             ]
         )
 
-        # Parse response
-        response_text = message.content[0].text.strip()
+        response_text = message.choices[0].message.content.strip()
 
-        # Clean up JSON if needed
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
@@ -75,7 +83,6 @@ Rules:
 
         medicines = json.loads(response_text)
 
-        # Save prescription record to Supabase
         supabase.table("prescriptions").insert({
             "patient_id": patient_id,
             "pharmacy_id": pharmacy_id,
@@ -100,24 +107,22 @@ Rules:
 
 @router.post("/confirm")
 async def confirm_and_add_medicines(
-    patient_id: str,
-    medicines: list,
+    body: ConfirmRequest,
     pharmacy_id: str = Header(...)
 ):
     """After prescription is read, chemist confirms and all medicines are added at once"""
     try:
-        from datetime import date
         records = []
 
-        for med in medicines:
+        for med in body.medicines:
             records.append({
                 "pharmacy_id": pharmacy_id,
-                "patient_id": patient_id,
-                "name": med["name"],
-                "dosage": med.get("dosage", "as prescribed"),
-                "refill_days": med.get("refill_days", 30),
+                "patient_id": body.patient_id,
+                "name": med.name,
+                "dosage": med.dosage,
+                "refill_days": med.refill_days,
                 "last_purchase_date": date.today().isoformat(),
-                "notes": med.get("instructions", "")
+                "notes": med.instructions
             })
 
         result = supabase.table("medicines")\
