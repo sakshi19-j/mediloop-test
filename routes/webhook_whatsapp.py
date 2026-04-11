@@ -7,6 +7,7 @@ import logging
 from fastapi import APIRouter, Request, Query
 from fastapi.responses import PlainTextResponse
 from database import supabase
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Webhooks"])
@@ -111,7 +112,7 @@ async def whatsapp_reply_webhook(request: Request):
             try:
                 supabase.table("patients").update({
                     "consent_given": True,
-                    "consent_given_at": "now()"
+                    "consent_given_at": datetime.utcnow().isoformat()
                 }).eq("id", patient["id"]).execute()
 
                 logger.info(f"[Webhook] Consent granted by {patient['name']} ({phone})")
