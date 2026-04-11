@@ -353,3 +353,45 @@ def get_journeys(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@router.post("/remind-all")
+async def remind_all_for_patient(patient_id: str, pharmacy_id: str = Header(...)):
+    try:
+        from whatsapp import send_bulk_reminder
+
+        meds = supabase.table("medicines") \
+            .select("*, patients(name, phone, opted_out, consent_given), pharmacies(name)") \
+            .eq("patient_id", patient_id) \
+            .eq("pharmacy_id", pharmacy_id) \
+            .eq("status", "active") \
+            .eq("is_deleted", False) \
+            .eq("is_paused", False) \
+            .execute()
+
+        if not meds.data:
+            raise HTTPException(status_code=404, detail="No medicines found")
+
+        patient = meds.data[0]["patients"]
+        pharmacy = meds.data[0]["pharmacies"]
+
+        if patient.get("opted_out"):
+            raise HTTPException(status_code=400, detail="Patient has opted out")
+
+        if not patient.get("consent_given"):
+            raise HTTPException(status_code=400, detail="Patient has not given consent")
+
+        medicine_names = [m["name"] for m in meds.data]
+
+        result = await send_bulk_reminder(
+            phone=patient["phone"],
+            patient_name=patient["name"],
+            medicine_names=medicine_names,
+            pharmacy_name=pharmacy["name"]
+        )
+
+        return {"message": f"Bulk reminder sent for {len(medicine_names)} medicines", "status": result["channel"]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
