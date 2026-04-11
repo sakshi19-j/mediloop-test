@@ -76,7 +76,7 @@ async def whatsapp_reply_webhook(request: Request):
     for p in phone_variants:
         try:
             result = supabase.table("patients") \
-                .select("id, name, pharmacy_id") \
+                .select("id, name, pharmacy_id, consent_given") \
                 .eq("phone", p) \
                 .eq("opted_out", False) \
                 .eq("is_deleted", False) \
@@ -100,14 +100,50 @@ async def whatsapp_reply_webhook(request: Request):
         logger.warning(f"[Webhook] No patient found for {phone}")
         return {"status": "ok", "action": "patient_not_found"}
 
+    # ── CONSENT FLOW — handle YES/NO to consent request ───────────────────
+    # Check if any patient is awaiting consent (consent_given is False)
+    awaiting_consent = [p for p in unique_patients if not p.get("consent_given")]
+
+    if awaiting_consent:
+        patient = awaiting_consent[0]
+
+        if raw_message in ["YES", "Y", "1", "HA", "HAN", "HAA"]:
+            try:
+                supabase.table("patients").update({
+                    "consent_given": True,
+                    "consent_given_at": "now()"
+                }).eq("id", patient["id"]).execute()
+
+                logger.info(f"[Webhook] Consent granted by {patient['name']} ({phone})")
+            except Exception as e:
+                logger.error(f"[Webhook] Consent YES error: {e}")
+
+            return {"status": "ok", "action": "consent_granted"}
+
+        if raw_message in ["NO", "N", "2", "NAI", "NAHI"]:
+            try:
+                supabase.table("patients").update({
+                    "consent_given": False,
+                    "opted_out": True,
+                    "opted_out_at": "now()"
+                }).eq("id", patient["id"]).execute()
+
+                logger.info(f"[Webhook] Consent declined by {patient['name']} ({phone})")
+            except Exception as e:
+                logger.error(f"[Webhook] Consent NO error: {e}")
+
+            return {"status": "ok", "action": "consent_declined"}
+
     # ── Find the patient with the most recent pending reminder log ─────────
     best_log = None
     best_patient = None
 
     for pat in unique_patients:
+        if not pat.get("consent_given"):
+            continue
         try:
             log_result = supabase.table("reminder_logs") \
-                .select("id, medicine_id, sent_at") \
+                .select("id, medicine_id, sent_at, journey_id") \
                 .eq("patient_id", pat["id"]) \
                 .eq("patient_replied", False) \
                 .order("sent_at", desc=True) \
@@ -128,55 +164,70 @@ async def whatsapp_reply_webhook(request: Request):
             logger.error(f"[Webhook] Log fetch error for patient {pat['id']}: {e}")
             continue
 
-    # ── YES ────────────────────────────────────────────────────────────────
-    # ── YES ────────────────────────────────────────────────────────────────
+    # ── YES — reorder request ──────────────────────────────────────────────
     if raw_message in ["YES", "Y", "1", "HA", "HAN", "HAA"]:
         if not best_log:
             logger.warning(f"[Webhook] No pending log for {phone}")
             return {"status": "ok", "action": "no_pending_reminder"}
 
         try:
-            supabase.table("reminder_logs").update({
-                "patient_replied": True,
-                "reply": "YES"
-            }).eq("id", best_log["id"]).execute()
+            # Mark ALL unreplied reminder logs for this patient as replied YES
+            # (because one stacked message covers multiple medicines)
+            unreplied_logs = supabase.table("reminder_logs") \
+                .select("id, medicine_id, journey_id") \
+                .eq("patient_id", best_patient["id"]) \
+                .eq("patient_replied", False) \
+                .execute()
 
-            supabase.table("medicines").update({
-                "status": "reorder_requested"
-            }).eq("id", best_log["medicine_id"]).execute()
+            for log in (unreplied_logs.data or []):
+                supabase.table("reminder_logs").update({
+                    "patient_replied": True,
+                    "reply": "YES"
+                }).eq("id", log["id"]).execute()
 
-            supabase.table("reorder_requests").insert({
-                "medicine_id": best_log["medicine_id"],
-                "patient_id": best_patient["id"],
-                "pharmacy_id": best_patient["pharmacy_id"],
-                "reminder_log_id": best_log["id"],
-                "status": "pending"
-            }).execute()
+                supabase.table("medicines").update({
+                    "status": "reorder_requested"
+                }).eq("id", log["medicine_id"]).execute()
 
-            # Mark journey as completed + conversion success
-            if best_log.get("journey_id"):
-                supabase.table("journeys").update({
-                    "status": "completed",
-                    "conversion_flag": 1
-                }).eq("id", best_log["journey_id"]).execute()
+                supabase.table("reorder_requests").insert({
+                    "medicine_id": log["medicine_id"],
+                    "patient_id": best_patient["id"],
+                    "pharmacy_id": best_patient["pharmacy_id"],
+                    "reminder_log_id": log["id"],
+                    "status": "pending"
+                }).execute()
 
-            logger.info(f"[Webhook] Reorder created — patient: {best_patient['name']}, medicine: {best_log['medicine_id']}")
+                if log.get("journey_id"):
+                    supabase.table("journeys").update({
+                        "status": "completed",
+                        "conversion_flag": 1
+                    }).eq("id", log["journey_id"]).execute()
+
+            logger.info(f"[Webhook] Reorder created for all medicines — patient: {best_patient['name']}")
 
         except Exception as e:
             logger.error(f"[Webhook] YES handler error: {e}")
 
         return {"status": "ok", "action": "reorder_requested"}
-    
+
     # ── NO ─────────────────────────────────────────────────────────────────
     if raw_message in ["NO", "N", "2", "NAI", "NAHI"]:
         if not best_log:
             return {"status": "ok", "action": "no_pending_reminder"}
 
         try:
-            supabase.table("reminder_logs").update({
-                "patient_replied": True,
-                "reply": "NO"
-            }).eq("id", best_log["id"]).execute()
+            # Mark ALL unreplied logs as NO
+            unreplied_logs = supabase.table("reminder_logs") \
+                .select("id") \
+                .eq("patient_id", best_patient["id"]) \
+                .eq("patient_replied", False) \
+                .execute()
+
+            for log in (unreplied_logs.data or []):
+                supabase.table("reminder_logs").update({
+                    "patient_replied": True,
+                    "reply": "NO"
+                }).eq("id", log["id"]).execute()
 
             logger.info(f"[Webhook] Skipped by patient: {phone}")
 

@@ -2,9 +2,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import date, timedelta
 from database import supabase
-from whatsapp import send_reminder
+from whatsapp import send_bulk_reminder, send_reminder
 import asyncio
 import pytz
+from collections import defaultdict
 
 scheduler = AsyncIOScheduler()
 IST = pytz.timezone("Asia/Kolkata")
@@ -39,7 +40,7 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
     print(f"[Scheduler] [{reminder_type}] Running for due date: {target_date}")
 
     result = supabase.table("medicines") \
-        .select("*, patients(name, phone, opted_out), pharmacies(name)") \
+        .select("*, patients(name, phone, opted_out, consent_given), pharmacies(name)") \
         .eq("next_due_date", target_date) \
         .eq("status", "active") \
         .eq("is_deleted", False) \
@@ -49,62 +50,83 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
     medicines = result.data
     print(f"[Scheduler] [{reminder_type}] Found {len(medicines)} medicines due")
 
+    # ── Group medicines by (patient_id, pharmacy_id) for stacking ──────────
+    grouped = defaultdict(list)
+    for med in medicines:
+        patient = med["patients"]
+
+        # Skip opted out patients
+        if patient.get("opted_out"):
+            continue
+
+        # Skip patients who have not given consent
+        if not patient.get("consent_given"):
+            print(f"[Scheduler] [{reminder_type}] No consent — skipping {patient['name']}")
+            continue
+
+        key = (med["patient_id"], med["pharmacy_id"])
+        grouped[key].append(med)
+
     sent = 0
     skipped = 0
     failed = 0
 
-    for med in medicines:
-        patient = med["patients"]
-        pharmacy = med["pharmacies"]
+    for (patient_id, pharmacy_id), patient_medicines in grouped.items():
+        patient = patient_medicines[0]["patients"]
+        pharmacy = patient_medicines[0]["pharmacies"]
 
-        if patient.get("opted_out"):
+        # Skip if already sent this reminder_type today for this patient
+        # Check on first medicine as proxy
+        already_sent = False
+        for med in patient_medicines:
+            existing = supabase.table("reminder_logs") \
+                .select("id") \
+                .eq("medicine_id", med["id"]) \
+                .eq("reminder_type", reminder_type) \
+                .gte("sent_at", date.today().isoformat()) \
+                .execute()
+            if existing.data:
+                already_sent = True
+                break
+
+        if already_sent:
+            print(f"[Scheduler] [{reminder_type}] Already sent today for patient {patient['name']}, skipping")
             skipped += 1
             continue
 
-        # Skip if this reminder_type was already sent today for this medicine
-        existing = supabase.table("reminder_logs") \
-            .select("id") \
-            .eq("medicine_id", med["id"]) \
-            .eq("whatsapp_status", "whatsapp") \
-            .eq("reminder_type", reminder_type) \
-            .gte("sent_at", date.today().isoformat()) \
-            .execute()
+        medicine_names = [m["name"] for m in patient_medicines]
 
-        if existing.data:
-            print(f"[Scheduler] [{reminder_type}] Already sent today for medicine {med['id']}, skipping")
-            skipped += 1
-            continue
-
-        # Get or create journey for this medicine cycle
-        journey_id = get_or_create_journey(med["id"], med["patient_id"], med["pharmacy_id"])
-
-        result = await send_reminder(
+        # Send ONE stacked message for all medicines
+        result = await send_bulk_reminder(
             phone=patient["phone"],
             patient_name=patient["name"],
-            medicine_name=med["name"],
+            medicine_names=medicine_names,
             pharmacy_name=pharmacy["name"]
         )
 
         log_status = result["channel"]
 
-        supabase.table("reminder_logs").insert({
-            "medicine_id": med["id"],
-            "patient_id": med["patient_id"],
-            "pharmacy_id": med["pharmacy_id"],
-            "whatsapp_status": log_status,
-            "reminder_type": reminder_type,
-            "journey_id": journey_id,
-        }).execute()
+        # Create journey + log for each medicine, but only one WhatsApp message sent
+        for med in patient_medicines:
+            journey_id = get_or_create_journey(med["id"], patient_id, pharmacy_id)
 
-        # Increment reminder count on journey
-        journey = supabase.table("journeys").select("total_reminders_sent").eq("id", journey_id).execute()
-        current_count = journey.data[0]["total_reminders_sent"] if journey.data else 0
-        supabase.table("journeys").update({
-            "total_reminders_sent": current_count + 1
-        }).eq("id", journey_id).execute()
+            supabase.table("reminder_logs").insert({
+                "medicine_id": med["id"],
+                "patient_id": patient_id,
+                "pharmacy_id": pharmacy_id,
+                "whatsapp_status": log_status,
+                "reminder_type": reminder_type,
+                "journey_id": journey_id,
+            }).execute()
+
+            journey = supabase.table("journeys").select("total_reminders_sent").eq("id", journey_id).execute()
+            current_count = journey.data[0]["total_reminders_sent"] if journey.data else 0
+            supabase.table("journeys").update({
+                "total_reminders_sent": current_count + 1
+            }).eq("id", journey_id).execute()
 
         if log_status != "failed":
-            print(f"[Scheduler] [{reminder_type}] Sent to {patient['name']} for {med['name']}")
+            print(f"[Scheduler] [{reminder_type}] Bulk sent to {patient['name']} — {len(medicine_names)} medicines: {', '.join(medicine_names)}")
             sent += 1
         else:
             print(f"[Scheduler] [{reminder_type}] FAILED for {patient['name']}: {result.get('error')}")
@@ -156,7 +178,7 @@ async def retry_failed_reminders():
     today = date.today().isoformat()
 
     failed = supabase.table("reminder_logs") \
-        .select("*, medicines(name, patient_id, pharmacy_id, is_paused, is_deleted, patients(name, phone, opted_out), pharmacies(name))") \
+        .select("*, medicines(name, patient_id, pharmacy_id, is_paused, is_deleted, patients(name, phone, opted_out, consent_given), pharmacies(name))") \
         .eq("whatsapp_status", "failed") \
         .gte("sent_at", today) \
         .execute()
@@ -169,7 +191,7 @@ async def retry_failed_reminders():
             continue
 
         patient = med["patients"]
-        if patient.get("opted_out"):
+        if patient.get("opted_out") or not patient.get("consent_given"):
             continue
 
         result = await send_reminder(

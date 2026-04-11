@@ -32,7 +32,7 @@ def normalize_phone(phone: str) -> str:
 
 
 @router.post("/")
-def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
+async def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
     try:
         sub = supabase.table("subscriptions")\
             .select("status, plan")\
@@ -88,10 +88,29 @@ def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
             "name": patient.name,
             "phone": normalized_phone,
             "disease_type": patient.disease_type,
-            "notes": patient.notes
+            "notes": patient.notes,
+            "consent_given": False,         # default — awaiting consent
+            "consent_requested_at": datetime.utcnow().isoformat()
         }).execute()
 
-        return {**result.data[0], "already_exists": False}
+        new_patient = result.data[0]
+
+        # Fetch pharmacy name for consent message
+        pharmacy = supabase.table("pharmacies")\
+            .select("name")\
+            .eq("id", pharmacy_id)\
+            .execute()
+        pharmacy_name = pharmacy.data[0]["name"] if pharmacy.data else "Your Pharmacy"
+
+        # Send WhatsApp consent request
+        from whatsapp import send_consent_request
+        await send_consent_request(
+            phone=normalized_phone,
+            patient_name=patient.name,
+            pharmacy_name=pharmacy_name
+        )
+
+        return {**new_patient, "already_exists": False, "consent_requested": True}
 
     except HTTPException:
         raise
@@ -141,6 +160,12 @@ async def import_patients_csv(
         skipped_duplicates = []
         errors = []
 
+        pharmacy = supabase.table("pharmacies")\
+            .select("name")\
+            .eq("id", pharmacy_id)\
+            .execute()
+        pharmacy_name = pharmacy.data[0]["name"] if pharmacy.data else "Your Pharmacy"
+
         for i, row in enumerate(reader):
             try:
                 phone = normalize_phone(row.get("phone", ""))
@@ -167,9 +192,20 @@ async def import_patients_csv(
                     "name": row.get("name", "").strip(),
                     "phone": phone,
                     "disease_type": row.get("disease_type", "Other").strip(),
-                    "notes": row.get("notes", "").strip()
+                    "notes": row.get("notes", "").strip(),
+                    "consent_given": False,
+                    "consent_requested_at": datetime.utcnow().isoformat()
                 }).execute()
-                patients_added.append(result.data[0])
+                new_patient = result.data[0]
+                patients_added.append(new_patient)
+
+                # Send consent request for each imported patient
+                from whatsapp import send_consent_request
+                await send_consent_request(
+                    phone=phone,
+                    patient_name=new_patient["name"],
+                    pharmacy_name=pharmacy_name
+                )
 
             except Exception as e:
                 errors.append({"row": i + 2, "name": row.get("name"), "error": str(e)})
