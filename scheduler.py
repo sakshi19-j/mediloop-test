@@ -76,7 +76,6 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
         pharmacy = patient_medicines[0]["pharmacies"]
 
         # Skip if already sent this reminder_type today for this patient
-        # Check on first medicine as proxy
         already_sent = False
         for med in patient_medicines:
             existing = supabase.table("reminder_logs") \
@@ -136,8 +135,10 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
 
 
 async def expire_old_journeys():
-    """Mark journeys with no YES reply after due date as expired."""
-    today = date.today().isoformat()
+    """Mark journeys with no YES reply as expired — only after 1 full day past due date."""
+    # FIX: was `due_date < today` which expired same-day reminders immediately.
+    # Now only expires journeys where due date was strictly before yesterday.
+    expiry_cutoff = (date.today() - timedelta(days=1)).isoformat()
 
     active_journeys = supabase.table("journeys") \
         .select("id, medicine_id") \
@@ -154,12 +155,12 @@ async def expire_old_journeys():
             continue
 
         due_date = med.data[0]["next_due_date"]
-        if due_date and due_date < today:
+        if due_date and due_date < expiry_cutoff:
             supabase.table("journeys").update({
                 "status": "expired",
                 "conversion_flag": 0
             }).eq("id", journey["id"]).execute()
-            print(f"[Scheduler] Journey {journey['id']} expired")
+            print(f"[Scheduler] Journey {journey['id']} expired (due: {due_date})")
 
 
 async def send_3day_reminders():

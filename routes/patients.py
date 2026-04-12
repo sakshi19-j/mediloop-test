@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Header, UploadFile, File
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from database import supabase
 from typing import Optional
 from datetime import datetime
@@ -9,6 +9,12 @@ import io
 
 router = APIRouter()
 
+# Placeholder values that should never be saved
+INVALID_PLACEHOLDERS = {
+    "string", "test", "none", "null", "na", "n/a", "undefined",
+    "placeholder", "example", "sample", "demo", "unknown"
+}
+
 
 class PatientCreate(BaseModel):
     name: str
@@ -16,12 +22,87 @@ class PatientCreate(BaseModel):
     disease_type: str
     notes: Optional[str] = None
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Name cannot be empty")
+        if len(v) < 2:
+            raise ValueError("Name must be at least 2 characters")
+        if v.lower() in INVALID_PLACEHOLDERS:
+            raise ValueError(f"'{v}' is not a valid patient name")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        v = v.strip().lstrip("+").replace(" ", "").replace("-", "")
+        digits = v.lstrip("91") if v.startswith("91") else v
+        if not digits.isdigit():
+            raise ValueError("Phone number must contain only digits")
+        if len(digits) != 10:
+            raise ValueError("Phone number must be 10 digits")
+        return v
+
+    @field_validator("disease_type")
+    @classmethod
+    def validate_disease_type(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Disease type cannot be empty")
+        if v.lower() in INVALID_PLACEHOLDERS:
+            raise ValueError(f"'{v}' is not a valid disease type")
+        return v
+
+    @field_validator("notes")
+    @classmethod
+    def validate_notes(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if v.lower() in INVALID_PLACEHOLDERS:
+            return None  # silently clear placeholder notes
+        return v or None
+
 
 class PatientUpdate(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
     disease_type: Optional[str] = None
     notes: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if len(v) < 2:
+            raise ValueError("Name must be at least 2 characters")
+        if v.lower() in INVALID_PLACEHOLDERS:
+            raise ValueError(f"'{v}' is not a valid patient name")
+        return v
+
+    @field_validator("disease_type")
+    @classmethod
+    def validate_disease_type(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if v.lower() in INVALID_PLACEHOLDERS:
+            raise ValueError(f"'{v}' is not a valid disease type")
+        return v
+
+    @field_validator("notes")
+    @classmethod
+    def validate_notes(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if v.lower() in INVALID_PLACEHOLDERS:
+            return None
+        return v or None
 
 
 def normalize_phone(phone: str) -> str:
@@ -89,20 +170,18 @@ async def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
             "phone": normalized_phone,
             "disease_type": patient.disease_type,
             "notes": patient.notes,
-            "consent_given": False,         # default — awaiting consent
+            "consent_given": False,
             "consent_requested_at": datetime.utcnow().isoformat()
         }).execute()
 
         new_patient = result.data[0]
 
-        # Fetch pharmacy name for consent message
         pharmacy = supabase.table("pharmacies")\
             .select("name")\
             .eq("id", pharmacy_id)\
             .execute()
         pharmacy_name = pharmacy.data[0]["name"] if pharmacy.data else "Your Pharmacy"
 
-        # Send WhatsApp consent request
         from whatsapp import send_consent_request
         await send_consent_request(
             phone=normalized_phone,
@@ -169,6 +248,17 @@ async def import_patients_csv(
         for i, row in enumerate(reader):
             try:
                 phone = normalize_phone(row.get("phone", ""))
+                name = row.get("name", "").strip()
+                disease_type = row.get("disease_type", "Other").strip()
+                notes_raw = row.get("notes", "").strip()
+
+                # Skip rows with placeholder values
+                if not name or name.lower() in INVALID_PLACEHOLDERS:
+                    errors.append({"row": i + 2, "name": name, "error": "Invalid or placeholder name"})
+                    continue
+
+                # Clear placeholder notes silently
+                notes = None if notes_raw.lower() in INVALID_PLACEHOLDERS else (notes_raw or None)
 
                 existing = supabase.table("patients")\
                     .select("id, name")\
@@ -180,7 +270,7 @@ async def import_patients_csv(
                 if existing.data:
                     skipped_duplicates.append({
                         "row": i + 2,
-                        "name": row.get("name"),
+                        "name": name,
                         "phone": phone,
                         "existing_patient_id": existing.data[0]["id"],
                         "existing_name": existing.data[0]["name"]
@@ -189,17 +279,16 @@ async def import_patients_csv(
 
                 result = supabase.table("patients").insert({
                     "pharmacy_id": pharmacy_id,
-                    "name": row.get("name", "").strip(),
+                    "name": name,
                     "phone": phone,
-                    "disease_type": row.get("disease_type", "Other").strip(),
-                    "notes": row.get("notes", "").strip(),
+                    "disease_type": disease_type,
+                    "notes": notes,
                     "consent_given": False,
                     "consent_requested_at": datetime.utcnow().isoformat()
                 }).execute()
                 new_patient = result.data[0]
                 patients_added.append(new_patient)
 
-                # Send consent request for each imported patient
                 from whatsapp import send_consent_request
                 await send_consent_request(
                     phone=phone,
