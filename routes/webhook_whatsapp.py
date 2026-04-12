@@ -49,6 +49,7 @@ async def whatsapp_reply_webhook(request: Request):
         msg = messages[0]
         phone = msg.get("from", "").strip().lstrip("+")
         raw_message = (msg.get("text", {}).get("body", "") or "").strip().upper()
+        raw_message_original = (msg.get("text", {}).get("body", "") or "").strip()
 
     except Exception as e:
         logger.error(f"[Webhook] Payload parse error: {e}")
@@ -102,7 +103,6 @@ async def whatsapp_reply_webhook(request: Request):
         return {"status": "ok", "action": "patient_not_found"}
 
     # ── CONSENT FLOW — handle YES/NO to consent request ───────────────────
-    # Check if any patient is awaiting consent (consent_given is False)
     awaiting_consent = [p for p in unique_patients if not p.get("consent_given")]
 
     if awaiting_consent:
@@ -114,11 +114,9 @@ async def whatsapp_reply_webhook(request: Request):
                     "consent_given": True,
                     "consent_given_at": datetime.utcnow().isoformat()
                 }).eq("id", patient["id"]).execute()
-
                 logger.info(f"[Webhook] Consent granted by {patient['name']} ({phone})")
             except Exception as e:
                 logger.error(f"[Webhook] Consent YES error: {e}")
-
             return {"status": "ok", "action": "consent_granted"}
 
         if raw_message in ["NO", "N", "2", "NAI", "NAHI"]:
@@ -128,11 +126,9 @@ async def whatsapp_reply_webhook(request: Request):
                     "opted_out": True,
                     "opted_out_at": "now()"
                 }).eq("id", patient["id"]).execute()
-
                 logger.info(f"[Webhook] Consent declined by {patient['name']} ({phone})")
             except Exception as e:
                 logger.error(f"[Webhook] Consent NO error: {e}")
-
             return {"status": "ok", "action": "consent_declined"}
 
     # ── Find the patient with the most recent pending reminder log ─────────
@@ -172,8 +168,6 @@ async def whatsapp_reply_webhook(request: Request):
             return {"status": "ok", "action": "no_pending_reminder"}
 
         try:
-            # Mark ALL unreplied reminder logs for this patient as replied YES
-            # (because one stacked message covers multiple medicines)
             unreplied_logs = supabase.table("reminder_logs") \
                 .select("id, medicine_id, journey_id") \
                 .eq("patient_id", best_patient["id"]) \
@@ -217,7 +211,6 @@ async def whatsapp_reply_webhook(request: Request):
             return {"status": "ok", "action": "no_pending_reminder"}
 
         try:
-            # Mark ALL unreplied logs as NO
             unreplied_logs = supabase.table("reminder_logs") \
                 .select("id") \
                 .eq("patient_id", best_patient["id"]) \
@@ -237,5 +230,34 @@ async def whatsapp_reply_webhook(request: Request):
 
         return {"status": "ok", "action": "skipped"}
 
+    # ── UNRECOGNISED — log it so chemist can follow up manually ───────────
     logger.info(f"[Webhook] Unrecognised reply from {phone}: '{raw_message}'")
+
+    try:
+        # Find which pharmacy this patient belongs to for the log
+        pharmacy_id = unique_patients[0]["pharmacy_id"] if unique_patients else None
+        patient_id = best_patient["id"] if best_patient else (
+            unique_patients[0]["id"] if unique_patients else None
+        )
+        patient_name = best_patient["name"] if best_patient else (
+            unique_patients[0]["name"] if unique_patients else "Unknown"
+        )
+
+        if pharmacy_id and patient_id:
+            supabase.table("unrecognised_replies").insert({
+                "phone": phone,
+                "patient_id": patient_id,
+                "patient_name": patient_name,
+                "pharmacy_id": pharmacy_id,
+                "message": raw_message_original,
+                "received_at": datetime.utcnow().isoformat(),
+                "reviewed": False
+            }).execute()
+
+            logger.info(f"[Webhook] Logged unrecognised reply from {patient_name} ({phone}): '{raw_message_original}'")
+
+    except Exception as e:
+        # Don't fail the webhook if logging fails
+        logger.error(f"[Webhook] Failed to log unrecognised reply: {e}")
+
     return {"status": "ok", "action": "unrecognised"}

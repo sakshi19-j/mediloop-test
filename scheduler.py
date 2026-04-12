@@ -1,6 +1,6 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from database import supabase
 from whatsapp import send_bulk_reminder, send_reminder
 import asyncio
@@ -50,16 +50,13 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
     medicines = result.data
     print(f"[Scheduler] [{reminder_type}] Found {len(medicines)} medicines due")
 
-    # ── Group medicines by (patient_id, pharmacy_id) for stacking ──────────
     grouped = defaultdict(list)
     for med in medicines:
         patient = med["patients"]
 
-        # Skip opted out patients
         if patient.get("opted_out"):
             continue
 
-        # Skip patients who have not given consent
         if not patient.get("consent_given"):
             print(f"[Scheduler] [{reminder_type}] No consent — skipping {patient['name']}")
             continue
@@ -75,7 +72,6 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
         patient = patient_medicines[0]["patients"]
         pharmacy = patient_medicines[0]["pharmacies"]
 
-        # Skip if already sent this reminder_type today for this patient
         already_sent = False
         for med in patient_medicines:
             existing = supabase.table("reminder_logs") \
@@ -95,7 +91,6 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
 
         medicine_names = [m["name"] for m in patient_medicines]
 
-        # Send ONE stacked message for all medicines
         result = await send_bulk_reminder(
             phone=patient["phone"],
             patient_name=patient["name"],
@@ -105,7 +100,6 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
 
         log_status = result["channel"]
 
-        # Create journey + log for each medicine, but only one WhatsApp message sent
         for med in patient_medicines:
             journey_id = get_or_create_journey(med["id"], patient_id, pharmacy_id)
 
@@ -136,8 +130,6 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
 
 async def expire_old_journeys():
     """Mark journeys with no YES reply as expired — only after 1 full day past due date."""
-    # FIX: was `due_date < today` which expired same-day reminders immediately.
-    # Now only expires journeys where due date was strictly before yesterday.
     expiry_cutoff = (date.today() - timedelta(days=1)).isoformat()
 
     active_journeys = supabase.table("journeys") \
@@ -161,6 +153,71 @@ async def expire_old_journeys():
                 "conversion_flag": 0
             }).eq("id", journey["id"]).execute()
             print(f"[Scheduler] Journey {journey['id']} expired (due: {due_date})")
+
+
+async def retry_pending_consent():
+    """
+    Task 7 — Consent retry.
+    Finds patients who:
+      - have NOT given consent (consent_given = False)
+      - have NOT opted out
+      - had consent requested 48+ hours ago
+      - have NOT already received a follow-up (consent_followup_sent = False or null)
+    Sends one follow-up consent message and marks consent_followup_sent = True.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+
+    print(f"[Consent Retry] Looking for patients with pending consent before {cutoff}")
+
+    try:
+        pending = supabase.table("patients") \
+            .select("id, name, phone, pharmacy_id, consent_followup_sent") \
+            .eq("consent_given", False) \
+            .eq("opted_out", False) \
+            .eq("is_deleted", False) \
+            .eq("is_active", True) \
+            .lte("consent_requested_at", cutoff) \
+            .execute()
+
+        patients = [
+            p for p in (pending.data or [])
+            if not p.get("consent_followup_sent")
+        ]
+
+        print(f"[Consent Retry] Found {len(patients)} patients needing follow-up")
+
+        for patient in patients:
+            try:
+                # Fetch pharmacy name
+                pharmacy = supabase.table("pharmacies") \
+                    .select("name") \
+                    .eq("id", patient["pharmacy_id"]) \
+                    .execute()
+                pharmacy_name = pharmacy.data[0]["name"] if pharmacy.data else "Your Pharmacy"
+
+                from whatsapp import send_consent_request
+                result = await send_consent_request(
+                    phone=patient["phone"],
+                    patient_name=patient["name"],
+                    pharmacy_name=pharmacy_name
+                )
+
+                # Mark follow-up sent regardless of WhatsApp result
+                # so we don't spam them if WhatsApp fails
+                supabase.table("patients") \
+                    .update({"consent_followup_sent": True}) \
+                    .eq("id", patient["id"]) \
+                    .execute()
+
+                status = result.get("channel", "failed")
+                print(f"[Consent Retry] Follow-up sent to {patient['name']} ({patient['phone']}) — {status}")
+
+            except Exception as e:
+                print(f"[Consent Retry] Failed for {patient['name']}: {e}")
+                continue
+
+    except Exception as e:
+        print(f"[Consent Retry] Job error: {e}")
 
 
 async def send_3day_reminders():
@@ -261,6 +318,11 @@ def start_scheduler():
         lambda: asyncio.create_task(check_subscription_expiry()),
         trigger=CronTrigger(hour=0, minute=0, timezone=IST),
         id="check_expiry"
+    )
+    scheduler.add_job(
+        lambda: asyncio.create_task(retry_pending_consent()),
+        trigger=CronTrigger(hour=10, minute=0, timezone=IST),
+        id="consent_retry"
     )
 
     scheduler.start()

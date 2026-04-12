@@ -62,7 +62,7 @@ class PatientCreate(BaseModel):
             return v
         v = v.strip()
         if v.lower() in INVALID_PLACEHOLDERS:
-            return None  # silently clear placeholder notes
+            return None
         return v or None
 
 
@@ -252,12 +252,10 @@ async def import_patients_csv(
                 disease_type = row.get("disease_type", "Other").strip()
                 notes_raw = row.get("notes", "").strip()
 
-                # Skip rows with placeholder values
                 if not name or name.lower() in INVALID_PLACEHOLDERS:
                     errors.append({"row": i + 2, "name": name, "error": "Invalid or placeholder name"})
                     continue
 
-                # Clear placeholder notes silently
                 notes = None if notes_raw.lower() in INVALID_PLACEHOLDERS else (notes_raw or None)
 
                 existing = supabase.table("patients")\
@@ -352,6 +350,54 @@ def lookup_by_phone(phone: str, pharmacy_id: str = Header(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/family/{phone}")
+def get_family_by_phone(phone: str, pharmacy_id: str = Header(...)):
+    """
+    Returns all patients sharing the same phone number under this pharmacy.
+    Used by the frontend to show a 'Family' group label on the patient card.
+    Only returns a family group if 2+ patients share the number.
+    """
+    try:
+        normalized = normalize_phone(phone)
+        phone_variants = [normalized]
+        # Also check the 10-digit version in case some were stored without country code
+        short = normalized.lstrip("91") if normalized.startswith("91") else normalized
+        if short != normalized:
+            phone_variants.append(short)
+
+        all_members = []
+        seen_ids = set()
+
+        for p in phone_variants:
+            result = supabase.table("patients")\
+                .select("id, name, disease_type, consent_given, opted_out, created_at")\
+                .eq("pharmacy_id", pharmacy_id)\
+                .eq("phone", p)\
+                .eq("is_deleted", False)\
+                .eq("is_active", True)\
+                .execute()
+
+            for pat in (result.data or []):
+                if pat["id"] not in seen_ids:
+                    seen_ids.add(pat["id"])
+                    all_members.append(pat)
+
+        if not all_members:
+            raise HTTPException(status_code=404, detail="No patients found for this phone number")
+
+        return {
+            "phone": normalized,
+            "is_family": len(all_members) > 1,
+            "member_count": len(all_members),
+            "members": all_members
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/")
 def get_patients(
     pharmacy_id: str = Header(...),
@@ -408,10 +454,32 @@ def get_patient_profile(patient_id: str, pharmacy_id: str = Header(...)):
             .limit(20)\
             .execute()
 
+        # Check if this patient has family members on the same phone
+        patient_data = patient.data[0]
+        family_info = None
+        try:
+            phone = patient_data.get("phone")
+            if phone:
+                siblings = supabase.table("patients")\
+                    .select("id, name, disease_type")\
+                    .eq("pharmacy_id", pharmacy_id)\
+                    .eq("phone", phone)\
+                    .eq("is_deleted", False)\
+                    .neq("id", patient_id)\
+                    .execute()
+                if siblings.data:
+                    family_info = {
+                        "is_family": True,
+                        "other_members": siblings.data
+                    }
+        except Exception:
+            pass
+
         return {
-            "patient": patient.data[0],
+            "patient": patient_data,
             "medicines": medicines.data,
-            "reminder_history": reminders.data
+            "reminder_history": reminders.data,
+            "family": family_info
         }
 
     except HTTPException:
