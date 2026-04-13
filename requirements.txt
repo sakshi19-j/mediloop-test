@@ -21,3 +21,6 @@ sentry-sdk[fastapi]
 
 # ── Task #3: Redis queue for WhatsApp sends ───────────────────────────────────
 redis
+
+# ── Task #4: Structured JSON logging (optional Logtail shipping) ──────────────
+logtail-python

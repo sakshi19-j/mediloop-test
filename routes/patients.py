@@ -1,15 +1,17 @@
-from fastapi import APIRouter, HTTPException, Header, UploadFile, File
+from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 from database import supabase
 from typing import Optional
 from datetime import datetime
+from audit import log_audit
+from logger_config import get_logger
 import csv
 import io
 
 router = APIRouter()
+logger = get_logger(__name__)
 
-# Placeholder values that should never be saved
 INVALID_PLACEHOLDERS = {
     "string", "test", "none", "null", "na", "n/a", "undefined",
     "placeholder", "example", "sample", "demo", "unknown"
@@ -113,7 +115,7 @@ def normalize_phone(phone: str) -> str:
 
 
 @router.post("/")
-async def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
+async def add_patient(patient: PatientCreate, request: Request, pharmacy_id: str = Header(...)):
     try:
         sub = supabase.table("subscriptions")\
             .select("status, plan")\
@@ -121,10 +123,7 @@ async def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
             .execute()
 
         if sub.data and sub.data[0]["status"] == "expired":
-            raise HTTPException(
-                status_code=402,
-                detail="Subscription expired. Please renew to continue."
-            )
+            raise HTTPException(status_code=402, detail="Subscription expired. Please renew to continue.")
 
         normalized_phone = normalize_phone(patient.phone)
 
@@ -159,10 +158,7 @@ async def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
                 .eq("is_deleted", False)\
                 .execute()
             if count.count >= limit:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Patient limit reached ({limit}). Please upgrade your plan."
-                )
+                raise HTTPException(status_code=403, detail=f"Patient limit reached ({limit}). Please upgrade your plan.")
 
         result = supabase.table("patients").insert({
             "pharmacy_id": pharmacy_id,
@@ -175,6 +171,23 @@ async def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
         }).execute()
 
         new_patient = result.data[0]
+
+        # ── Audit log ──────────────────────────────────────────────────────
+        log_audit(
+            pharmacy_id=pharmacy_id,
+            actor_id=pharmacy_id,
+            action="created",
+            entity_type="patient",
+            entity_id=new_patient["id"],
+            new_data={"name": patient.name, "disease_type": patient.disease_type},
+            ip_address=request.client.host if request.client else None,
+        )
+
+        logger.info("Patient created", extra={
+            "pharmacy_id": pharmacy_id,
+            "patient_id": new_patient["id"],
+            "name": patient.name,
+        })
 
         pharmacy = supabase.table("pharmacies")\
             .select("name")\
@@ -194,6 +207,7 @@ async def add_patient(patient: PatientCreate, pharmacy_id: str = Header(...)):
     except HTTPException:
         raise
     except Exception as e:
+        logger.error("Patient create failed", extra={"pharmacy_id": pharmacy_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -206,11 +220,11 @@ def export_patients_csv(pharmacy_id: str = Header(...)):
             .eq("is_deleted", False)\
             .execute()
 
+        log_audit(pharmacy_id=pharmacy_id, actor_id=pharmacy_id,
+                  action="exported", entity_type="patient", entity_id="all")
+
         output = io.StringIO()
-        writer = csv.DictWriter(
-            output,
-            fieldnames=["name", "phone", "disease_type", "notes", "created_at"]
-        )
+        writer = csv.DictWriter(output, fieldnames=["name", "phone", "disease_type", "notes", "created_at"])
         writer.writeheader()
         writer.writerows(result.data)
         output.seek(0)
@@ -220,16 +234,12 @@ def export_patients_csv(pharmacy_id: str = Header(...)):
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=patients_export.csv"}
         )
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/import")
-async def import_patients_csv(
-    file: UploadFile = File(...),
-    pharmacy_id: str = Header(...)
-):
+async def import_patients_csv(file: UploadFile = File(...), pharmacy_id: str = Header(...)):
     try:
         content = await file.read()
         decoded = content.decode("utf-8")
@@ -239,10 +249,7 @@ async def import_patients_csv(
         skipped_duplicates = []
         errors = []
 
-        pharmacy = supabase.table("pharmacies")\
-            .select("name")\
-            .eq("id", pharmacy_id)\
-            .execute()
+        pharmacy = supabase.table("pharmacies").select("name").eq("id", pharmacy_id).execute()
         pharmacy_name = pharmacy.data[0]["name"] if pharmacy.data else "Your Pharmacy"
 
         for i, row in enumerate(reader):
@@ -267,9 +274,7 @@ async def import_patients_csv(
 
                 if existing.data:
                     skipped_duplicates.append({
-                        "row": i + 2,
-                        "name": name,
-                        "phone": phone,
+                        "row": i + 2, "name": name, "phone": phone,
                         "existing_patient_id": existing.data[0]["id"],
                         "existing_name": existing.data[0]["name"]
                     })
@@ -287,15 +292,23 @@ async def import_patients_csv(
                 new_patient = result.data[0]
                 patients_added.append(new_patient)
 
+                log_audit(pharmacy_id=pharmacy_id, actor_id=pharmacy_id,
+                          action="created", entity_type="patient",
+                          entity_id=new_patient["id"],
+                          new_data={"name": name, "source": "csv_import"})
+
                 from whatsapp import send_consent_request
-                await send_consent_request(
-                    phone=phone,
-                    patient_name=new_patient["name"],
-                    pharmacy_name=pharmacy_name
-                )
+                await send_consent_request(phone=phone, patient_name=name, pharmacy_name=pharmacy_name)
 
             except Exception as e:
                 errors.append({"row": i + 2, "name": row.get("name"), "error": str(e)})
+
+        logger.info("CSV import completed", extra={
+            "pharmacy_id": pharmacy_id,
+            "imported": len(patients_added),
+            "skipped": len(skipped_duplicates),
+            "errors": len(errors),
+        })
 
         return {
             "imported": len(patients_added),
@@ -304,7 +317,6 @@ async def import_patients_csv(
             "duplicates": skipped_duplicates,
             "errors": errors
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -314,16 +326,11 @@ def handle_opt_out(phone: str):
     try:
         normalized = normalize_phone(phone)
         supabase.table("patients")\
-            .update({
-                "opted_out": True,
-                "opted_out_at": datetime.utcnow().isoformat()
-            })\
+            .update({"opted_out": True, "opted_out_at": datetime.utcnow().isoformat()})\
             .eq("phone", normalized)\
             .execute()
-
         supabase.table("opt_outs").upsert({"phone": normalized}).execute()
         return {"message": "Opted out successfully"}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -338,12 +345,9 @@ def lookup_by_phone(phone: str, pharmacy_id: str = Header(...)):
             .eq("phone", normalized)\
             .eq("is_deleted", False)\
             .execute()
-
         if not result.data:
             raise HTTPException(status_code=404, detail="No patient found with this phone number")
-
         return result.data[0]
-
     except HTTPException:
         raise
     except Exception as e:
@@ -352,15 +356,9 @@ def lookup_by_phone(phone: str, pharmacy_id: str = Header(...)):
 
 @router.get("/family/{phone}")
 def get_family_by_phone(phone: str, pharmacy_id: str = Header(...)):
-    """
-    Returns all patients sharing the same phone number under this pharmacy.
-    Used by the frontend to show a 'Family' group label on the patient card.
-    Only returns a family group if 2+ patients share the number.
-    """
     try:
         normalized = normalize_phone(phone)
         phone_variants = [normalized]
-        # Also check the 10-digit version in case some were stored without country code
         short = normalized.lstrip("91") if normalized.startswith("91") else normalized
         if short != normalized:
             phone_variants.append(short)
@@ -376,7 +374,6 @@ def get_family_by_phone(phone: str, pharmacy_id: str = Header(...)):
                 .eq("is_deleted", False)\
                 .eq("is_active", True)\
                 .execute()
-
             for pat in (result.data or []):
                 if pat["id"] not in seen_ids:
                     seen_ids.add(pat["id"])
@@ -391,7 +388,6 @@ def get_family_by_phone(phone: str, pharmacy_id: str = Header(...)):
             "member_count": len(all_members),
             "members": all_members
         }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -415,15 +411,12 @@ def get_patients(
 
         if disease_type:
             query = query.eq("disease_type", disease_type)
-
         if search:
             query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%")
 
         offset = (page - 1) * limit
         result = query.order("name").range(offset, offset + limit - 1).execute()
-
         return {"data": result.data, "page": page, "limit": limit}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -454,7 +447,6 @@ def get_patient_profile(patient_id: str, pharmacy_id: str = Header(...)):
             .limit(20)\
             .execute()
 
-        # Check if this patient has family members on the same phone
         patient_data = patient.data[0]
         family_info = None
         try:
@@ -468,10 +460,7 @@ def get_patient_profile(patient_id: str, pharmacy_id: str = Header(...)):
                     .neq("id", patient_id)\
                     .execute()
                 if siblings.data:
-                    family_info = {
-                        "is_family": True,
-                        "other_members": siblings.data
-                    }
+                    family_info = {"is_family": True, "other_members": siblings.data}
         except Exception:
             pass
 
@@ -481,7 +470,6 @@ def get_patient_profile(patient_id: str, pharmacy_id: str = Header(...)):
             "reminder_history": reminders.data,
             "family": family_info
         }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -489,8 +477,12 @@ def get_patient_profile(patient_id: str, pharmacy_id: str = Header(...)):
 
 
 @router.patch("/{patient_id}")
-def update_patient(patient_id: str, body: PatientUpdate, pharmacy_id: str = Header(...)):
+def update_patient(patient_id: str, body: PatientUpdate, request: Request, pharmacy_id: str = Header(...)):
     try:
+        # Snapshot old data before update for audit diff
+        old = supabase.table("patients").select("*").eq("id", patient_id).eq("pharmacy_id", pharmacy_id).execute()
+        old_data = old.data[0] if old.data else {}
+
         updates = {k: v for k, v in body.dict().items() if v is not None}
 
         if "phone" in updates:
@@ -502,12 +494,8 @@ def update_patient(patient_id: str, body: PatientUpdate, pharmacy_id: str = Head
                 .eq("is_deleted", False)\
                 .neq("id", patient_id)\
                 .execute()
-
             if conflict.data:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Phone {updates['phone']} is already registered to another patient."
-                )
+                raise HTTPException(status_code=409, detail=f"Phone {updates['phone']} is already registered to another patient.")
 
         updates["updated_at"] = "now()"
 
@@ -520,8 +508,22 @@ def update_patient(patient_id: str, body: PatientUpdate, pharmacy_id: str = Head
         if not result.data:
             raise HTTPException(status_code=404, detail="Patient not found")
 
-        return result.data[0]
+        # ── Audit log ──────────────────────────────────────────────────────
+        changed_fields = {k: v for k, v in body.dict().items() if v is not None}
+        log_audit(
+            pharmacy_id=pharmacy_id,
+            actor_id=pharmacy_id,
+            action="updated",
+            entity_type="patient",
+            entity_id=patient_id,
+            old_data={k: old_data.get(k) for k in changed_fields},
+            new_data=changed_fields,
+            ip_address=request.client.host if request.client else None,
+        )
 
+        logger.info("Patient updated", extra={"pharmacy_id": pharmacy_id, "patient_id": patient_id, "fields": list(changed_fields.keys())})
+
+        return result.data[0]
     except HTTPException:
         raise
     except Exception as e:
@@ -529,8 +531,12 @@ def update_patient(patient_id: str, body: PatientUpdate, pharmacy_id: str = Head
 
 
 @router.delete("/{patient_id}")
-def delete_patient(patient_id: str, pharmacy_id: str = Header(...)):
+def delete_patient(patient_id: str, request: Request, pharmacy_id: str = Header(...)):
     try:
+        # Snapshot before delete
+        old = supabase.table("patients").select("name, phone, disease_type").eq("id", patient_id).eq("pharmacy_id", pharmacy_id).execute()
+        old_data = old.data[0] if old.data else {}
+
         supabase.table("patients")\
             .update({"is_deleted": True, "is_active": False})\
             .eq("id", patient_id)\
@@ -542,7 +548,19 @@ def delete_patient(patient_id: str, pharmacy_id: str = Header(...)):
             .eq("patient_id", patient_id)\
             .execute()
 
-        return {"message": "Patient deleted successfully"}
+        # ── Audit log ──────────────────────────────────────────────────────
+        log_audit(
+            pharmacy_id=pharmacy_id,
+            actor_id=pharmacy_id,
+            action="deleted",
+            entity_type="patient",
+            entity_id=patient_id,
+            old_data=old_data,
+            ip_address=request.client.host if request.client else None,
+        )
 
+        logger.info("Patient deleted", extra={"pharmacy_id": pharmacy_id, "patient_id": patient_id})
+
+        return {"message": "Patient deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
