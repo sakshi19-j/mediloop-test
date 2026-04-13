@@ -15,3 +15,9 @@ reportlab
 anthropic
 pytz
 openai
+
+# ── Task #2: Sentry error tracking ───────────────────────────────────────────
+sentry-sdk[fastapi]
+
+# ── Task #3: Redis queue for WhatsApp sends ───────────────────────────────────
+redis

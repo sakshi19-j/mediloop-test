@@ -3,6 +3,7 @@ from apscheduler.triggers.cron import CronTrigger
 from datetime import date, timedelta, datetime, timezone
 from database import supabase
 from whatsapp import send_bulk_reminder, send_reminder
+from queue_worker import enqueue_reminder, get_redis_connection
 import asyncio
 import pytz
 from collections import defaultdict
@@ -50,13 +51,13 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
     medicines = result.data
     print(f"[Scheduler] [{reminder_type}] Found {len(medicines)} medicines due")
 
+    # ── Group medicines by (patient_id, pharmacy_id) for stacking ────────────
     grouped = defaultdict(list)
     for med in medicines:
         patient = med["patients"]
 
         if patient.get("opted_out"):
             continue
-
         if not patient.get("consent_given"):
             print(f"[Scheduler] [{reminder_type}] No consent — skipping {patient['name']}")
             continue
@@ -64,14 +65,21 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
         key = (med["patient_id"], med["pharmacy_id"])
         grouped[key].append(med)
 
-    sent = 0
-    skipped = 0
-    failed = 0
+    # ── Check if Redis queue is available ─────────────────────────────────────
+    # If Redis is configured: enqueue jobs (non-blocking, resilient)
+    # If not configured: fall back to direct sends (original behaviour)
+    use_queue = get_redis_connection() is not None
+
+    enqueued = 0
+    sent     = 0
+    skipped  = 0
+    failed   = 0
 
     for (patient_id, pharmacy_id), patient_medicines in grouped.items():
-        patient = patient_medicines[0]["patients"]
+        patient  = patient_medicines[0]["patients"]
         pharmacy = patient_medicines[0]["pharmacies"]
 
+        # Dedup — don't resend if this reminder_type already went today
         already_sent = False
         for med in patient_medicines:
             existing = supabase.table("reminder_logs") \
@@ -85,47 +93,89 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
                 break
 
         if already_sent:
-            print(f"[Scheduler] [{reminder_type}] Already sent today for patient {patient['name']}, skipping")
+            print(f"[Scheduler] [{reminder_type}] Already sent today for {patient['name']}, skipping")
             skipped += 1
             continue
 
         medicine_names = [m["name"] for m in patient_medicines]
+        medicine_ids   = [m["id"] for m in patient_medicines]
 
-        result = await send_bulk_reminder(
+        # ── Create journeys before send — consistent regardless of send method ─
+        for med in patient_medicines:
+            journey_id = get_or_create_journey(med["id"], patient_id, pharmacy_id)
+
+            # When using queue: worker writes the log after send with real status.
+            # When direct: write a pending log now, update status after send below.
+            if not use_queue:
+                supabase.table("reminder_logs").insert({
+                    "medicine_id":    med["id"],
+                    "patient_id":     patient_id,
+                    "pharmacy_id":    pharmacy_id,
+                    "whatsapp_status": "pending",
+                    "reminder_type":  reminder_type,
+                    "journey_id":     journey_id,
+                }).execute()
+
+            journey = supabase.table("journeys") \
+                .select("total_reminders_sent") \
+                .eq("id", journey_id) \
+                .execute()
+            current_count = journey.data[0]["total_reminders_sent"] if journey.data else 0
+            supabase.table("journeys").update({
+                "total_reminders_sent": current_count + 1
+            }).eq("id", journey_id).execute()
+
+        # ── Via Redis queue (preferred) ───────────────────────────────────────
+        if use_queue:
+            job_id = enqueue_reminder(
+                phone=patient["phone"],
+                patient_name=patient["name"],
+                medicine_names=medicine_names,
+                pharmacy_name=pharmacy["name"],
+                pharmacy_id=pharmacy_id,
+                patient_id=patient_id,
+                reminder_type=reminder_type,
+                medicine_ids=medicine_ids,
+            )
+            if job_id:
+                print(f"[Scheduler] [{reminder_type}] Enqueued for {patient['name']} — {len(medicine_names)} medicines")
+                enqueued += 1
+            else:
+                print(f"[Scheduler] [{reminder_type}] Queue failed for {patient['name']}, skipping")
+                skipped += 1
+            continue  # Worker handles the actual send
+
+        # ── Direct send (fallback when Redis not available) ───────────────────
+        send_result = await send_bulk_reminder(
             phone=patient["phone"],
             patient_name=patient["name"],
             medicine_names=medicine_names,
             pharmacy_name=pharmacy["name"]
         )
 
-        log_status = result["channel"]
+        log_status = send_result["channel"]
 
+        # Update the pending log entries with the real send status
         for med in patient_medicines:
-            journey_id = get_or_create_journey(med["id"], patient_id, pharmacy_id)
-
-            supabase.table("reminder_logs").insert({
-                "medicine_id": med["id"],
-                "patient_id": patient_id,
-                "pharmacy_id": pharmacy_id,
-                "whatsapp_status": log_status,
-                "reminder_type": reminder_type,
-                "journey_id": journey_id,
-            }).execute()
-
-            journey = supabase.table("journeys").select("total_reminders_sent").eq("id", journey_id).execute()
-            current_count = journey.data[0]["total_reminders_sent"] if journey.data else 0
-            supabase.table("journeys").update({
-                "total_reminders_sent": current_count + 1
-            }).eq("id", journey_id).execute()
+            supabase.table("reminder_logs") \
+                .update({"whatsapp_status": log_status}) \
+                .eq("medicine_id", med["id"]) \
+                .eq("reminder_type", reminder_type) \
+                .eq("pharmacy_id", pharmacy_id) \
+                .gte("sent_at", date.today().isoformat()) \
+                .execute()
 
         if log_status != "failed":
-            print(f"[Scheduler] [{reminder_type}] Bulk sent to {patient['name']} — {len(medicine_names)} medicines: {', '.join(medicine_names)}")
+            print(f"[Scheduler] [{reminder_type}] Sent to {patient['name']} — {', '.join(medicine_names)}")
             sent += 1
         else:
-            print(f"[Scheduler] [{reminder_type}] FAILED for {patient['name']}: {result.get('error')}")
+            print(f"[Scheduler] [{reminder_type}] FAILED for {patient['name']}: {send_result.get('error')}")
             failed += 1
 
-    print(f"[Scheduler] [{reminder_type}] Done — sent: {sent}, skipped: {skipped}, failed: {failed}")
+    if use_queue:
+        print(f"[Scheduler] [{reminder_type}] Done — enqueued: {enqueued}, skipped: {skipped}")
+    else:
+        print(f"[Scheduler] [{reminder_type}] Done — sent: {sent}, skipped: {skipped}, failed: {failed}")
 
 
 async def expire_old_journeys():
@@ -157,16 +207,10 @@ async def expire_old_journeys():
 
 async def retry_pending_consent():
     """
-    Task 7 — Consent retry.
-    Finds patients who:
-      - have NOT given consent (consent_given = False)
-      - have NOT opted out
-      - had consent requested 48+ hours ago
-      - have NOT already received a follow-up (consent_followup_sent = False or null)
-    Sends one follow-up consent message and marks consent_followup_sent = True.
+    Finds patients with no consent reply 48+ hours after request.
+    Sends one follow-up via queue if available, direct otherwise.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
-
     print(f"[Consent Retry] Looking for patients with pending consent before {cutoff}")
 
     try:
@@ -186,31 +230,39 @@ async def retry_pending_consent():
 
         print(f"[Consent Retry] Found {len(patients)} patients needing follow-up")
 
+        use_queue = get_redis_connection() is not None
+
         for patient in patients:
             try:
-                # Fetch pharmacy name
                 pharmacy = supabase.table("pharmacies") \
                     .select("name") \
                     .eq("id", patient["pharmacy_id"]) \
                     .execute()
                 pharmacy_name = pharmacy.data[0]["name"] if pharmacy.data else "Your Pharmacy"
 
-                from whatsapp import send_consent_request
-                result = await send_consent_request(
-                    phone=patient["phone"],
-                    patient_name=patient["name"],
-                    pharmacy_name=pharmacy_name
-                )
+                if use_queue:
+                    from queue_worker import enqueue_consent
+                    enqueue_consent(
+                        phone=patient["phone"],
+                        patient_name=patient["name"],
+                        pharmacy_name=pharmacy_name,
+                        pharmacy_id=patient["pharmacy_id"],
+                        patient_id=patient["id"],
+                    )
+                else:
+                    from whatsapp import send_consent_request
+                    await send_consent_request(
+                        phone=patient["phone"],
+                        patient_name=patient["name"],
+                        pharmacy_name=pharmacy_name
+                    )
 
-                # Mark follow-up sent regardless of WhatsApp result
-                # so we don't spam them if WhatsApp fails
                 supabase.table("patients") \
                     .update({"consent_followup_sent": True}) \
                     .eq("id", patient["id"]) \
                     .execute()
 
-                status = result.get("channel", "failed")
-                print(f"[Consent Retry] Follow-up sent to {patient['name']} ({patient['phone']}) — {status}")
+                print(f"[Consent Retry] Follow-up {'queued' if use_queue else 'sent'} for {patient['name']}")
 
             except Exception as e:
                 print(f"[Consent Retry] Failed for {patient['name']}: {e}")
@@ -233,6 +285,10 @@ async def send_due_reminders():
 
 
 async def retry_failed_reminders():
+    """
+    Retries failed reminder_logs from today. Always direct send —
+    these are already logged, worker just needs to resend.
+    """
     today = date.today().isoformat()
 
     failed = supabase.table("reminder_logs") \
