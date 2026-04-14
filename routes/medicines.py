@@ -64,7 +64,7 @@ def add_medicine(medicine: MedicineCreate, request: Request, pharmacy_id: str = 
             "pharmacy_id": pharmacy_id,
             "medicine_id": new_med["id"],
             "patient_id": medicine.patient_id,
-            "name": medicine.name,
+            "medicine_name": medicine.name,  # fixed: was 'name' (reserved LogRecord field)
         })
 
         return new_med
