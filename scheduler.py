@@ -6,10 +6,15 @@ from whatsapp import send_bulk_reminder, send_reminder
 from queue_worker import enqueue_reminder, get_redis_connection
 import asyncio
 import pytz
+import os
 from collections import defaultdict
 
 scheduler = AsyncIOScheduler()
 IST = pytz.timezone("Asia/Kolkata")
+
+LIVEKIT_URL        = os.getenv("LIVEKIT_URL")
+LIVEKIT_API_KEY    = os.getenv("LIVEKIT_API_KEY")
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 
 
 def get_or_create_journey(medicine_id: str, patient_id: str, pharmacy_id: str) -> str:
@@ -65,9 +70,6 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
         key = (med["patient_id"], med["pharmacy_id"])
         grouped[key].append(med)
 
-    # ── Check if Redis queue is available ─────────────────────────────────────
-    # If Redis is configured: enqueue jobs (non-blocking, resilient)
-    # If not configured: fall back to direct sends (original behaviour)
     use_queue = get_redis_connection() is not None
 
     enqueued = 0
@@ -100,20 +102,17 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
         medicine_names = [m["name"] for m in patient_medicines]
         medicine_ids   = [m["id"] for m in patient_medicines]
 
-        # ── Create journeys before send — consistent regardless of send method ─
         for med in patient_medicines:
             journey_id = get_or_create_journey(med["id"], patient_id, pharmacy_id)
 
-            # When using queue: worker writes the log after send with real status.
-            # When direct: write a pending log now, update status after send below.
             if not use_queue:
                 supabase.table("reminder_logs").insert({
-                    "medicine_id":    med["id"],
-                    "patient_id":     patient_id,
-                    "pharmacy_id":    pharmacy_id,
+                    "medicine_id":     med["id"],
+                    "patient_id":      patient_id,
+                    "pharmacy_id":     pharmacy_id,
                     "whatsapp_status": "pending",
-                    "reminder_type":  reminder_type,
-                    "journey_id":     journey_id,
+                    "reminder_type":   reminder_type,
+                    "journey_id":      journey_id,
                 }).execute()
 
             journey = supabase.table("journeys") \
@@ -125,7 +124,6 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
                 "total_reminders_sent": current_count + 1
             }).eq("id", journey_id).execute()
 
-        # ── Via Redis queue (preferred) ───────────────────────────────────────
         if use_queue:
             job_id = enqueue_reminder(
                 phone=patient["phone"],
@@ -143,9 +141,8 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
             else:
                 print(f"[Scheduler] [{reminder_type}] Queue failed for {patient['name']}, skipping")
                 skipped += 1
-            continue  # Worker handles the actual send
+            continue
 
-        # ── Direct send (fallback when Redis not available) ───────────────────
         send_result = await send_bulk_reminder(
             phone=patient["phone"],
             patient_name=patient["name"],
@@ -155,7 +152,6 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
 
         log_status = send_result["channel"]
 
-        # Update the pending log entries with the real send status
         for med in patient_medicines:
             supabase.table("reminder_logs") \
                 .update({"whatsapp_status": log_status}) \
@@ -176,6 +172,127 @@ async def send_reminders_for_offset(days_offset: int, reminder_type: str):
         print(f"[Scheduler] [{reminder_type}] Done — enqueued: {enqueued}, skipped: {skipped}")
     else:
         print(f"[Scheduler] [{reminder_type}] Done — sent: {sent}, skipped: {skipped}, failed: {failed}")
+
+
+# ── Voice Call Fallback ────────────────────────────────────────────────────────
+async def trigger_voice_fallback_calls():
+    """
+    Runs at 9:30 AM IST daily.
+    Finds reminder_logs from yesterday where:
+      - WhatsApp was sent (whatsapp_status = 'whatsapp')
+      - Patient has NOT replied (patient_replied = False)
+    Then triggers a LiveKit voice call as fallback for each medicine.
+    Skips if voice call already attempted today for that reminder_log.
+    """
+    if not LIVEKIT_URL or not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
+        print("[Voice Fallback] LiveKit env vars not set — skipping")
+        return
+
+    yesterday_start = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    yesterday_end   = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+
+    print(f"[Voice Fallback] Checking no-reply reminders between {yesterday_start} and {yesterday_end}")
+
+    try:
+        logs = supabase.table("reminder_logs") \
+            .select("id, medicine_id, patient_id, pharmacy_id, journey_id") \
+            .eq("whatsapp_status", "whatsapp") \
+            .eq("patient_replied", False) \
+            .gte("sent_at", yesterday_start) \
+            .lte("sent_at", yesterday_end) \
+            .execute()
+
+        pending_logs = logs.data or []
+        print(f"[Voice Fallback] Found {len(pending_logs)} no-reply reminders")
+
+        for log in pending_logs:
+            reminder_log_id = log["id"]
+            medicine_id     = log["medicine_id"]
+            patient_id      = log["patient_id"]
+            pharmacy_id     = log["pharmacy_id"]
+
+            # Check patient is still active and not opted out
+            try:
+                patient = supabase.table("patients") \
+                    .select("id, name, phone, opted_out, is_deleted") \
+                    .eq("id", patient_id) \
+                    .single() \
+                    .execute().data
+
+                if not patient or patient.get("opted_out") or patient.get("is_deleted"):
+                    print(f"[Voice Fallback] Skipping — patient inactive or opted out: {patient_id}")
+                    continue
+            except Exception as e:
+                print(f"[Voice Fallback] Patient fetch error: {e}")
+                continue
+
+            # Check medicine is still active
+            try:
+                medicine = supabase.table("medicines") \
+                    .select("id, name, status, is_deleted, is_paused") \
+                    .eq("id", medicine_id) \
+                    .single() \
+                    .execute().data
+
+                if not medicine or medicine.get("is_deleted") or medicine.get("is_paused"):
+                    print(f"[Voice Fallback] Skipping — medicine inactive: {medicine_id}")
+                    continue
+            except Exception as e:
+                print(f"[Voice Fallback] Medicine fetch error: {e}")
+                continue
+
+            # Skip if voice call already dispatched for this log
+            already_called = supabase.table("reminder_logs") \
+                .select("id") \
+                .eq("id", reminder_log_id) \
+                .eq("whatsapp_status", "voice_dispatched") \
+                .execute()
+
+            if already_called.data:
+                print(f"[Voice Fallback] Already called for log {reminder_log_id} — skipping")
+                continue
+
+            # ── Dispatch LiveKit voice call ────────────────────────────────
+            try:
+                from livekit import api as livekit_api
+
+                room_name = f"mediloop_{patient_id}_{medicine_id}_{reminder_log_id}"
+
+                lk = livekit_api.LiveKitAPI(
+                    url=LIVEKIT_URL,
+                    api_key=LIVEKIT_API_KEY,
+                    api_secret=LIVEKIT_API_SECRET,
+                )
+
+                await lk.room.create_room(
+                    livekit_api.CreateRoomRequest(name=room_name)
+                )
+
+                await lk.agent.create_dispatch(
+                    livekit_api.CreateAgentDispatchRequest(
+                        agent_name="mediloop-voice-agent",
+                        room=room_name,
+                    )
+                )
+
+                await lk.aclose()
+
+                # Mark reminder_log as voice_dispatched
+                supabase.table("reminder_logs").update({
+                    "whatsapp_status": "voice_dispatched"
+                }).eq("id", reminder_log_id).execute()
+
+                print(
+                    f"[Voice Fallback] Call dispatched — "
+                    f"patient: {patient['name']} | medicine: {medicine['name']} | room: {room_name}"
+                )
+
+            except Exception as e:
+                print(f"[Voice Fallback] LiveKit dispatch error for {patient_id}: {e}")
+                continue
+
+    except Exception as e:
+        print(f"[Voice Fallback] Job error: {e}")
 
 
 async def expire_old_journeys():
@@ -380,6 +497,12 @@ def start_scheduler():
         trigger=CronTrigger(hour=10, minute=0, timezone=IST),
         id="consent_retry"
     )
+    # ── Voice call fallback — fires 24hrs after WhatsApp, no reply ────────
+    scheduler.add_job(
+        lambda: asyncio.create_task(trigger_voice_fallback_calls()),
+        trigger=CronTrigger(hour=9, minute=30, timezone=IST),
+        id="voice_fallback"
+    )
 
     scheduler.start()
-    print("[Scheduler] Started")
+    print("[Scheduler] Started — including voice fallback at 09:30 IST")

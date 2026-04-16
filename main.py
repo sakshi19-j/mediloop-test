@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from scheduler import start_scheduler
 from routes import auth, patients, medicines, dashboard, billing, prescriptions
 from routes.webhook_whatsapp import router as whatsapp_webhook_router
+from routes import voice
 
 # ── Sentry ────────────────────────────────────────────────────────────────────
 _sentry_dsn = os.getenv("SENTRY_DSN")
@@ -62,6 +63,7 @@ app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["Dashboar
 app.include_router(billing.router, prefix="/api/v1/billing", tags=["Billing"])
 app.include_router(prescriptions.router, prefix="/api/v1/prescriptions", tags=["Prescriptions"])
 app.include_router(whatsapp_webhook_router)
+app.include_router(voice.router, prefix="/api/v1/voice", tags=["Voice"])
 
 
 @app.on_event("startup")
