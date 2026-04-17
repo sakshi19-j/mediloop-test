@@ -186,7 +186,7 @@ async def add_patient(patient: PatientCreate, request: Request, pharmacy_id: str
         logger.info("Patient created", extra={
             "pharmacy_id": pharmacy_id,
             "patient_id": new_patient["id"],
-            "name": patient.name,
+            "patient_name": patient.name,
         })
 
         pharmacy = supabase.table("pharmacies")\
