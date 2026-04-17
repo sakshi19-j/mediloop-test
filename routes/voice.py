@@ -99,7 +99,7 @@ async def trigger_voice_call(
         )
 
         # Dispatch agent worker to handle this room
-        await lk.agent.create_dispatch(
+        await lk.agent_dispatch.create_dispatch(
             livekit_api.CreateAgentDispatchRequest(
                 agent_name="mediloop-voice-agent",
                 room=room_name,

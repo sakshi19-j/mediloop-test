@@ -268,7 +268,7 @@ async def trigger_voice_fallback_calls():
                     livekit_api.CreateRoomRequest(name=room_name)
                 )
 
-                await lk.agent.create_dispatch(
+                await lk.agent_dispatch.create_dispatch(
                     livekit_api.CreateAgentDispatchRequest(
                         agent_name="mediloop-voice-agent",
                         room=room_name,

@@ -189,7 +189,7 @@ Rules:
             tts=sarvam.TTS(
                 target_language_code="hi-IN",
                 model="bulbul:v3",
-                speaker="anand",  # Male voice — change to "priya" for female
+                speaker="rahul",  # Male voice — change to "priya" for female
             ),
         )
 
